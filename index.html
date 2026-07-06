@@ -84,6 +84,9 @@
   }
   .match.champbox{border:none;background:transparent}
   .match .slot.swapsel{background:#fff3bf;outline:2px solid #f0a500;border-radius:5px}
+  .match.moveable{cursor:pointer}
+  .match.moveable:hover{outline:2px dashed #2f80c9}
+  .match.movesel{outline:3px solid #2f80c9;background:#eaf4fc}
   .mno{display:inline-block;font-size:10px;font-weight:700;color:#fff;background:#6b6356;border-radius:4px;padding:0 5px;margin-right:5px;letter-spacing:.5px}
   .match .slot{display:flex;align-items:center;gap:6px;padding:7px 9px;border-bottom:1px dashed var(--line)}
   .match .slot:last-of-type{border-bottom:none}
@@ -1270,13 +1273,17 @@ function renderBracketTab(){
        Skriv resultatet i rutan och välj <b>vinnare</b> i listan (eller klicka på spelarens namn).
        Vinnaren förs automatiskt vidare och nästa match blir spelklar i <b>Schema → Ej schemalagda</b>.</p>
      ${ui.swapMode?`<div class="hint" style="border-color:#f0a500;background:#fff8e6;margin-top:10px">
-        🔀 <b>Bytesläge på:</b> klicka på en spelare i första omgången och sedan på en annan – de byter plats. (Berörda resultat nollställs.)</div>`:''}
+        🔀 <b>${L('Bytesläge på:','Swap mode on:')}</b> ${L('klicka på en spelare och sedan på en annan – de byter plats. Fungerar mellan omgång 1 och omgång 2, även för <b>seedade</b> spelare (en seed som gått vidare på bye byts via sin plats i omgång 2). (Berörda resultat nollställs.)','click a player and then another – they swap places. Works between round 1 and round 2, including <b>seeded</b> players (a seed advanced on a bye is swapped via its slot in round 2). (Affected results are cleared.)')}</div>`:''}
+     ${ui.moveMode?`<div class="hint" style="border-color:#2f80c9;background:#eaf4fc;margin-top:10px">
+        ↔ <b>${L('Flytta match på:','Move-match mode on:')}</b> ${L('klicka på en match i första omgången och sedan på en annan – de byter plats i trädet (hela paret). Så väljer du t.ex. vilken match som möter en seedad spelare i andra omgången. (Berörda resultat nollställs.)','click a match in the first round and then another – they swap positions in the tree (the whole pair). This is how you choose e.g. which match meets a seeded player in the second round. (Affected results are cleared.)')}</div>`:''}
      <div class="row" style="margin-top:10px">
-       <button class="btn ${ui.swapMode?'':'ghost'} mini" id="swapMode">🔀 Byt spelare ${ui.swapMode?'(på)':''}</button>
+       <button class="btn ${ui.swapMode?'':'ghost'} mini" id="swapMode">🔀 ${L('Byt spelare','Swap players')} ${ui.swapMode?'('+L('på','on')+')':''}</button>
+       <button class="btn ${ui.moveMode?'':'ghost'} mini" id="moveMode">↔ ${L('Flytta match','Move match')} ${ui.moveMode?'('+L('på','on')+')':''}</button>
        <button class="btn ghost mini" id="rebuildBr">🔁 Lotta om / bygg stege</button>
        <button class="btn gray mini" id="clearBr">🗑 Rensa flik (denna stege)</button>
        <span style="flex:1"></span>
-       <button class="btn ghost mini" id="imgBr">📷 Spara bild av stege</button>
+       <button class="btn ghost mini" id="imgBr">📷 ${L('Spara bild av stege','Save bracket image')}</button>
+       <button class="btn ghost mini" id="imgAllBr">📷 ${L('Bild av alla stegar','Image of all brackets')}</button>
        <button class="btn mini" id="printBr">🖨 Skriv ut stege</button>
      </div>
      ${cls.participants.length?`
@@ -1290,12 +1297,14 @@ function renderBracketTab(){
      </div>`:''}
    </div>
    <div id="bracketWrap"></div>`;
-  document.getElementById("clsSel").onchange=e=>{ui.classId=e.target.value; ui.swapSel=null; render();};
+  document.getElementById("clsSel").onchange=e=>{ui.classId=e.target.value; ui.swapSel=null; ui.moveSel=null; render();};
   document.getElementById("rebuildBr").onclick=()=>rebuildBracketOf(cls);
   document.getElementById("clearBr").onclick=()=>clearBracketOf(cls);
-  document.getElementById("swapMode").onclick=()=>{ ui.swapMode=!ui.swapMode; ui.swapSel=null; render(); };
+  document.getElementById("swapMode").onclick=()=>{ ui.swapMode=!ui.swapMode; if(ui.swapMode){ui.moveMode=false;ui.moveSel=null;} ui.swapSel=null; render(); };
+  document.getElementById("moveMode").onclick=()=>{ ui.moveMode=!ui.moveMode; if(ui.moveMode){ui.swapMode=false;ui.swapSel=null;} ui.moveSel=null; render(); };
   document.getElementById("printBr").onclick=()=>printOneBracket(cls);
   document.getElementById("imgBr").onclick=()=>exportBracketImage(cls);
+  document.getElementById("imgAllBr").onclick=()=>exportAllBracketImages();
   const replBtnBr=document.getElementById("replBtnBr");
   if(replBtnBr) replBtnBr.onclick=()=>{
     const oldEntry=document.getElementById("replSelBr").value;
@@ -1329,10 +1338,18 @@ function renderBracketTab(){
   html+=`</div></div>`;
   wrap.innerHTML=html;
   // events
+  // Flytta-match-läge: klick på hela matchrutan (första omgången) väljer/byter match.
+  if(ui.moveMode){
+    document.querySelectorAll('.match[data-r="0"]').forEach(el=>{
+      const i=+el.dataset.i, m=cls.matches.find(x=>x.round===0&&x.index===i);
+      if(m) el.onclick=()=>handleMoveClick(cls,m);
+    });
+  }
   cls.matches.forEach(m=>{
     ["p1","p2"].forEach(slot=>{
       const el=document.getElementById(`nm_${m.id}_${slot}`);
-      if(el) el.onclick=()=>{
+      if(el) el.onclick=(ev)=>{
+        if(ui.moveMode){ ev.stopPropagation(); handleMoveClick(cls,m); return; }
         if(ui.swapMode) handleSwapClick(cls,m,slot);
         else if(m[slot]) setWinner(cls,m,m[slot]);
       };
@@ -1408,16 +1425,19 @@ function layoutBracketEl(br){
 }
 function matchHTML(cls,m,total){
   const sel=ui.swapSel;
+  // Vald spelare (för markering) – hämtas från den kanoniska round-0-platsen.
+  const selPlayer = sel ? (cls.matches.find(x=>x.id===sel.id)||{})[sel.key] : null;
   const slotHTML=(p,key)=>{
     let cl="slot", nm=dispName(p);
     if(p===null){ cl+= (m.round===0?" bye":" tbd"); nm=(m.round===0?"BYE":"– vinnare –"); }
     if(m.winner && p && m.winner===p) cl+=" win";
-    if(sel && sel.id===m.id && sel.key===key) cl+=" swapsel";
+    if(selPlayer && p && p===selPlayer) cl+=" swapsel";   // markera spelaren överallt (även i omgång 2)
     return `<div class="${cl}"><span class="nm" id="nm_${m.id}_${key}">${nm||""}</span>${m.winner===p?' 🏆':''}</div>`;
   };
   const sched = m.day?`<div class="sched-tag">${matchNoTag(m)}📅 ${dayShort(m.day)} · ${m.time!=null?matchLabel(m):'-'} · Bana ${m.court||'-'}</div>`
                      :(matchNumber(m)!=null?`<div class="sched-tag">${matchNoTag(m)}</div>`:"");
-  return `<div class="match" data-r="${m.round}" data-i="${m.index}" style="border-left:5px solid ${classColor(cls)}">
+  const moveCls = (ui.moveMode && m.round===0) ? (ui.moveSel===m.id?" moveable movesel":" moveable") : "";
+  return `<div class="match${moveCls}" data-r="${m.round}" data-i="${m.index}" style="border-left:5px solid ${classColor(cls)}">
      ${slotHTML(m.p1,"p1")}
      ${slotHTML(m.p2,"p2")}
      ${ (m.p1&&m.p2) ? `<div class="scorerow">
@@ -1431,15 +1451,43 @@ function matchHTML(cls,m,total){
      ${sched}
    </div>`;
 }
-// Byt plats på två spelare i omgång 0 (inom samma klass).
-function handleSwapClick(cls,m,slot){
-  if(m.round!==0 || !m[slot]) return;            // endast riktiga spelare i första omgången
-  if(!ui.swapSel){ ui.swapSel={id:m.id,key:slot}; render(); return; }
-  if(ui.swapSel.id===m.id && ui.swapSel.key===slot){ ui.swapSel=null; render(); return; }
-  const A=cls.matches.find(x=>x.id===ui.swapSel.id), aKey=ui.swapSel.key;
-  if(!A){ ui.swapSel=null; render(); return; }
-  const tmp=A[aKey]; A[aKey]=m[slot]; m[slot]=tmp;   // byt plats
+// Byt plats på två hela matcher i omgång 0 (flyttar paren i trädet).
+function handleMoveClick(cls,m){
+  if(m.round!==0) return;
+  if(!ui.moveSel){ ui.moveSel=m.id; render(); return; }
+  if(ui.moveSel===m.id){ ui.moveSel=null; render(); return; }   // avmarkera
+  const A=cls.matches.find(x=>x.id===ui.moveSel);
+  if(!A){ ui.moveSel=null; render(); return; }
+  // Byt hela innehållet (båda spelarna) mellan matcherna.
+  const p1=A.p1, p2=A.p2; A.p1=m.p1; A.p2=m.p2; m.p1=p1; m.p2=p2;
+  // Nollställ ev. resultat och nedströms-placering för de berörda matcherna.
   [A,m].forEach(x=>{ if(x.winner){ x.winner=null; x.score=""; } clearDownstream(cls,x); });
+  ui.moveSel=null;
+  resolveByes(cls); recompChampion(cls); save(); render();
+}
+// Kanonisk round-0-plats för en klickad spelare. En spelare i omgång 0 pekar på sin
+// egen plats; en spelare i senare omgång (t.ex. seedad som gått vidare på bye) pekar
+// på sin round-0 bye-match. Spelare som nått hit via en spelad match går ej att flytta.
+function canonicalRound0Slot(cls, m, slot){
+  const player=m[slot];
+  if(!player) return null;                       // tom plats / BYE / TBD
+  if(m.round===0) return {id:m.id, key:slot};
+  const orig=cls.matches.find(x=>x.round===0 && (x.p1===player||x.p2===player) && (x.p1===null||x.p2===null));
+  if(!orig) return null;                          // beror på en spelad match – ej flyttbar
+  return {id:orig.id, key: orig.p1===player?"p1":"p2"};
+}
+// Byt plats på två spelare i trädet. Fungerar även för en seedad spelare som visas i
+// omgång 2 (byts då via sin round-0 bye-match) – dvs byte mellan omgång 1 och omgång 2.
+function handleSwapClick(cls,m,slot){
+  const canon=canonicalRound0Slot(cls,m,slot);
+  if(!canon) return;                              // ej flyttbar plats
+  if(!ui.swapSel){ ui.swapSel=canon; render(); return; }
+  if(ui.swapSel.id===canon.id && ui.swapSel.key===canon.key){ ui.swapSel=null; render(); return; }
+  const A=cls.matches.find(x=>x.id===ui.swapSel.id), aKey=ui.swapSel.key;
+  const B=cls.matches.find(x=>x.id===canon.id), bKey=canon.key;
+  if(!A||!B){ ui.swapSel=null; render(); return; }
+  const tmp=A[aKey]; A[aKey]=B[bKey]; B[bKey]=tmp;   // byt plats på de två round-0-platserna
+  [A,B].forEach(x=>{ if(x.winner){ x.winner=null; x.score=""; } clearDownstream(cls,x); });
   ui.swapSel=null;
   resolveByes(cls); recompChampion(cls); save(); render();
 }
@@ -2427,6 +2475,7 @@ function renderPrintTab(){
        <button class="btn" id="printResults">🖨 Skriv ut resultatlista (vald dag)</button>
        <button class="btn ghost" id="printSched2">🖨 Skriv ut matchschema (vald dag)</button>
        <button class="btn ghost" id="printBrackets">🖨 Skriv ut alla stegar</button>
+       <button class="btn ghost" id="imgAllBr2">📷 Spara alla stegar som bild</button>
        <button class="btn ghost" id="printBlank2">🖨 Skriv ut blankt schema</button>
        <button class="btn" id="printChamps">🏆 Skriv ut alla klubbmästare</button>
      </div>
@@ -2436,6 +2485,7 @@ function renderPrintTab(){
   document.getElementById("printResults").onclick=()=>printResults(ui.day);
   document.getElementById("printSched2").onclick=()=>printSchedule(ui.day);
   document.getElementById("printBrackets").onclick=()=>printBrackets();
+  document.getElementById("imgAllBr2").onclick=()=>exportAllBracketImages();
   document.getElementById("printBlank2").onclick=()=>printBlankSchedule();
   document.getElementById("printChamps").onclick=()=>printChampions();
   // förhandsvisning av resultat
@@ -2666,37 +2716,76 @@ function buildBracketSVG(cls){
   }
   return {body, width, height};
 }
-// Skapa en PNG-bild av den valda stegen och spara där användaren väljer.
-function exportBracketImage(cls){
+// Filnamn för en steges bild (arrangörsoberoende, med tidsstämpel).
+function bracketImageFilename(cls){
+  const p=n=>String(n).padStart(2,"0"), d=new Date();
+  const stamp=`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}`;
+  return `Stege-${cls.name.replace(/[^\wåäöÅÄÖ -]/g,'').trim()}-${stamp}.png`;
+}
+// Skapa PNG-bild (Blob) av en steges träd. Ren SVG -> canvas -> PNG (ingen taint).
+function bracketImageBlob(cls){
+  return new Promise((resolve,reject)=>{
+    const PAD=20, TITLE_H=36, SCALE=2;
+    const {body, width, height}=buildBracketSVG(cls);
+    const W=width+PAD*2, H=height+TITLE_H+PAD;
+    const title=`${arrangerName()} · ${state.tournament.name||"KM"} ${tournamentYear()} · ${cls.name}${cls.champion?' · 🏆 '+dispName(cls.champion):''}`;
+    const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`+
+      `<rect width="100%" height="100%" fill="#ffffff"/>`+
+      `<text x="${PAD}" y="26" font-family="Arial,Helvetica,sans-serif" font-size="17" font-weight="bold" fill="${headColor()}">${escXml(title)}</text>`+
+      `<g transform="translate(${PAD},${TITLE_H})">${body}</g></svg>`;
+    const url=URL.createObjectURL(new Blob([svg],{type:"image/svg+xml;charset=utf-8"}));
+    const img=new Image();
+    img.onload=()=>{
+      try{
+        const canvas=document.createElement("canvas");
+        canvas.width=Math.round(W*SCALE); canvas.height=Math.round(H*SCALE);
+        const ctx=canvas.getContext("2d"); ctx.setTransform(SCALE,0,0,SCALE,0,0); ctx.drawImage(img,0,0);
+        URL.revokeObjectURL(url);
+        canvas.toBlob(b=>{ b?resolve(b):reject(new Error("toBlob")); }, "image/png");
+      }catch(err){ URL.revokeObjectURL(url); reject(err); }
+    };
+    img.onerror=()=>{ URL.revokeObjectURL(url); reject(new Error("render")); };
+    img.src=url;
+  });
+}
+// Skapa och spara en PNG-bild av den valda stegen där användaren väljer.
+async function exportBracketImage(cls){
   if(!totalRounds(cls)){ alert("Stegen är tom – bygg den först."); return; }
-  const PAD=20, TITLE_H=36, SCALE=2;
-  const {body, width, height}=buildBracketSVG(cls);
-  const W=width+PAD*2, H=height+TITLE_H+PAD;
-  const title=`${arrangerName()} · ${state.tournament.name||"KM"} ${tournamentYear()} · ${cls.name}${cls.champion?' · 🏆 '+dispName(cls.champion):''}`;
-  const svg=`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}">`+
-    `<rect width="100%" height="100%" fill="#ffffff"/>`+
-    `<text x="${PAD}" y="26" font-family="Arial,Helvetica,sans-serif" font-size="17" font-weight="bold" fill="${headColor()}">${escXml(title)}</text>`+
-    `<g transform="translate(${PAD},${TITLE_H})">${body}</g></svg>`;
-  const url=URL.createObjectURL(new Blob([svg],{type:"image/svg+xml;charset=utf-8"}));
-  const img=new Image();
-  img.onload=()=>{
+  try{ const b=await bracketImageBlob(cls); await saveBlob(b, bracketImageFilename(cls)); }
+  catch(err){ alert("Kunde inte skapa bilden: "+(err.message||err)); }
+}
+// Skapa en bild för VARJE stege med ett klick. Välj en mapp en gång -> alla bilder dit;
+// annars laddas bilderna ned var för sig (hamnar i Hämtade filer).
+async function exportAllBracketImages(){
+  const list=visibleClasses().filter(c=>totalRounds(c));
+  if(!list.length){ alert("Ingen stege att spara – bygg minst en stege först."); return; }
+  if(window.showDirectoryPicker){
+    let dir=null;
+    try{ dir=await window.showDirectoryPicker(); }
+    catch(e){ if(e&&e.name==="AbortError") return; dir=null; }
+    if(dir){
+      let ok=0, fail=0;
+      for(const cls of list){
+        try{
+          const b=await bracketImageBlob(cls);
+          const fh=await dir.getFileHandle(bracketImageFilename(cls),{create:true});
+          const w=await fh.createWritable(); await w.write(b); await w.close(); ok++;
+        }catch(e){ fail++; }
+      }
+      alert(`Sparade ${ok} stege-bild${ok===1?'':'er'}${fail?` (${fail} misslyckades)`:''} i vald mapp.`);
+      return;
+    }
+  }
+  // Reserv: ladda ned varje bild (t.ex. Safari/Firefox utan mappväljare).
+  let ok=0;
+  for(const cls of list){
     try{
-      const canvas=document.createElement("canvas");
-      canvas.width=Math.round(W*SCALE); canvas.height=Math.round(H*SCALE);
-      const ctx=canvas.getContext("2d");
-      ctx.setTransform(SCALE,0,0,SCALE,0,0);
-      ctx.drawImage(img,0,0);
-      URL.revokeObjectURL(url);
-      canvas.toBlob(b=>{
-        if(!b){ alert("Kunde inte skapa bilden."); return; }
-        const p=n=>String(n).padStart(2,"0"), d=new Date();
-        const stamp=`${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}`;
-        saveBlob(b, `Stege-${cls.name.replace(/[^\wåäöÅÄÖ -]/g,'').trim()}-${stamp}.png`);
-      }, "image/png");
-    }catch(err){ URL.revokeObjectURL(url); alert("Kunde inte skapa bilden: "+err.message); }
-  };
-  img.onerror=()=>{ URL.revokeObjectURL(url); alert("Kunde inte rendera stegen till bild."); };
-  img.src=url;
+      const b=await bracketImageBlob(cls);
+      const a=document.createElement("a"); a.href=URL.createObjectURL(b); a.download=bracketImageFilename(cls); a.click();
+      await new Promise(r=>setTimeout(r,450)); URL.revokeObjectURL(a.href); ok++;
+    }catch(e){}
+  }
+  alert(`Skapade ${ok} stege-bild${ok===1?'':'er'} (hämtade som nedladdningar).`);
 }
 
 /* ----- Export / import (säkerhetskopia) – anropas från Turneringsinformation ----- */
