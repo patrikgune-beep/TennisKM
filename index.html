@@ -159,6 +159,11 @@
   /* print */
   #printArea{display:none}
   .brpage{position:relative;overflow:hidden;background:#fff}
+  /* Publik läsvy: dölj all redigering (admin-delen) */
+  body.public .adminonly{ display:none !important; }
+  body.public .mtile .ctrls{ display:none !important; }
+  body.public .mtile .conflictmsg, body.public .mtile .softreq{ display:none !important; }
+  body:not(.public) .publiconly{ display:none !important; }
   @page land{ size:A4 landscape; margin:6mm }
   @media print{
     header.app,.tabs,.toolbar,.daybar,#app,.no-print{display:none !important}
@@ -181,6 +186,8 @@
     <p class="sub" id="appSub">Dalarö Tennisklubb</p>
   </div>
   <div class="spacer"></div>
+  <button id="adminBtn" class="btn ghost mini no-print" style="white-space:nowrap"></button>
+  <div class="sync-badge no-print js-sync" id="syncBadge" style="font-size:12px;opacity:.95;white-space:nowrap"></div>
   <div class="tabs" id="tabs"></div>
 </header>
 
@@ -382,6 +389,8 @@ function normalize(s){
   if(!s.diplomaSigns || typeof s.diplomaSigns!=="object") s.diplomaSigns={ director:true, chairman:true, trainers:false };
   { const d=defaultSched(); s.sched = Object.assign(d, (s.sched && typeof s.sched==="object") ? s.sched : {}); }
   if(typeof s.venue!=="string") s.venue="";
+  if(typeof s.adminPin!=="string") s.adminPin="";
+  if(typeof s.updatedAt!=="number") s.updatedAt=0;
   if(!s.extraCourts) s.extraCourts={};
   if(!s.lockedDays) s.lockedDays={};
   if(!s.planFinalDays) s.planFinalDays={};
@@ -483,7 +492,233 @@ function ensureDay(){
   if(!ui.day || !days.some(d=>d.date===ui.day)) ui.day=days[0].date;
 }
 function load(){ try{ const r=localStorage.getItem(LS_KEY); return r?JSON.parse(r):null; }catch(e){ return null; } }
-function save(){ localStorage.setItem(LS_KEY, JSON.stringify(state)); }
+function saveLocal(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(state)); }catch(e){} }
+// Publik läsvy kan ALDRIG skriva (varken lokalt eller till molnet) – bara admin sparar.
+function save(){ if(!isAdmin()) return; state.updatedAt = Date.now(); saveLocal(); cloudSchedulePush(); }
+
+/* ===================== Admin / publik läsvy =====================
+   Publik vy (standard) = endast Stege + Schema, ingen redigering.
+   Admin låses upp med en PIN och kommer ihåg per enhet (localStorage).   */
+const ADMIN_PIN = "2323";   // Standard-PIN (används tills en egen PIN satts under Turneringsinformation).
+function adminPin(){ return (state && typeof state.adminPin==="string" && state.adminPin.trim()) ? state.adminPin.trim() : ADMIN_PIN; }
+function isAdmin(){ try{ return localStorage.getItem("km_admin")==="1"; }catch(e){ return false; } }
+function setAdminFlag(on){ try{ if(on) localStorage.setItem("km_admin","1"); else localStorage.removeItem("km_admin"); }catch(e){} }
+function promptAdmin(){
+  const pin=prompt(L("Ange admin-PIN för att låsa upp redigering:","Enter admin PIN to unlock editing:"));
+  if(pin==null) return;
+  if(pin===adminPin()){ setAdminFlag(true); cloudInit(); render(); }
+  else alert(L("Fel PIN.","Wrong PIN."));
+}
+function lockAdmin(){
+  setAdminFlag(false);
+  ui.tab="bracket"; ui.swapMode=ui.moveMode=ui.numMode=false;
+  render();
+}
+function updateAdminBtn(){
+  const b=document.getElementById("adminBtn"); if(!b) return;
+  if(isAdmin()){ b.textContent="🔓 "+L("Publik vy","Public view"); b.title=L("Lås till publik läsvy (dölj redigering)","Lock to public read-only view"); b.onclick=lockAdmin; }
+  else { b.textContent="🔒 Admin"; b.title=L("Lås upp redigering (kräver PIN)","Unlock editing (requires PIN)"); b.onclick=promptAdmin; }
+}
+
+/* ===================== Molnsynk (Supabase) =====================
+   Delar hela tillståndet (state) mellan enheter via en delad rad i
+   tabellen "tournaments". Ingen serverkod – webbläsaren pratar direkt
+   med Supabase. localStorage används fortfarande som offline-backup.   */
+const SUPA_URL  = "https://nciruaqemnzlbfkldgvf.supabase.co/rest/v1";
+const SUPA_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5jaXJ1YXFlbW56bGJma2xkZ3ZmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM0Mzk1NTQsImV4cCI6MjA5OTAxNTU1NH0.YBiWJLch1jz9oZrf4V7CskNqVz5j6285AeaAoPYC2bs";
+const TOURN_KEY = "dalaro-km";   // delad nyckel – alla enheter som använder denna delar samma data
+const cloudEnabled = /^https?:\/\//.test(SUPA_URL) && SUPA_KEY.length>20;
+let cloudStatus = "off";         // off | connecting | ok | saving | offline
+let cloudLastSync = 0;
+let cloudLastError = "";          // senaste felet (för felsökning)
+let _pushTimer = null, _polling = false;
+
+function cloudHeaders(extra){ return Object.assign({ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY, "Content-Type":"application/json" }, extra||{}); }
+
+async function cloudGet(){
+  let r;
+  try{ r = await fetch(`${SUPA_URL}/tournaments?key=eq.${encodeURIComponent(TOURN_KEY)}&select=data`, { headers: cloudHeaders() }); }
+  catch(e){ cloudLastError="Nätverksfel (GET): "+e.message; throw e; }
+  if(!r.ok){ const body=await r.text().catch(()=>"" ); cloudLastError=`GET HTTP ${r.status} – ${body.slice(0,180)}`; throw new Error(cloudLastError); }
+  const rows = await r.json();
+  return (Array.isArray(rows) && rows.length) ? rows[0].data : null;
+}
+// Skriv en rad utan att kräva unik constraint på "key":
+// försök UPPDATERA (PATCH) befintlig rad, och INFOGA (POST) bara om ingen fanns.
+async function cloudUpsertRow(key, data){
+  const fail=(where,r,body)=>{ const e=new Error(`${where} HTTP ${r.status} – ${(body||"").slice(0,180)}`); e.status=r.status; e.body=body||""; cloudLastError=e.message; return e; };
+  // 1) UPPDATERA
+  let r;
+  try{ r = await fetch(`${SUPA_URL}/tournaments?key=eq.${encodeURIComponent(key)}`, {
+    method:"PATCH",
+    headers: cloudHeaders({ Prefer:"return=representation" }),
+    body: JSON.stringify({ data })
+  }); }
+  catch(e){ cloudLastError="Nätverksfel (PATCH): "+e.message; throw e; }
+  if(!r.ok){ throw fail("PATCH", r, await r.text().catch(()=>"" )); }
+  let rows=[]; try{ rows=await r.json(); }catch(e){}
+  if(Array.isArray(rows) && rows.length){ cloudLastError=""; return; }   // en rad uppdaterades → klart
+  // 2) INFOGA (ingen rad fanns)
+  let r2;
+  try{ r2 = await fetch(`${SUPA_URL}/tournaments`, {
+    method:"POST",
+    headers: cloudHeaders({ Prefer:"return=minimal" }),
+    body: JSON.stringify({ key, data })
+  }); }
+  catch(e){ cloudLastError="Nätverksfel (POST): "+e.message; throw e; }
+  if(!r2.ok){ throw fail("POST", r2, await r2.text().catch(()=>"" )); }
+  cloudLastError="";   // lyckad skrivning – nollställ felet
+}
+async function cloudPut(data){ return cloudUpsertRow(TOURN_KEY, data); }
+function cloudSetStatus(s){ cloudStatus=s; updateSyncBadge(); }
+function cloudSchedulePush(){
+  if(!cloudEnabled) return;
+  clearTimeout(_pushTimer);
+  _pushTimer=setTimeout(async ()=>{
+    cloudSetStatus("saving");
+    try{ await cloudPut(state); cloudLastSync=Date.now(); cloudSetStatus("ok"); }
+    catch(e){ cloudSetStatus("offline"); }
+  }, 800);
+}
+// Hämta molnets version och tillämpa den om den är nyare än vår.
+async function cloudPull(rerender){
+  if(!cloudEnabled) return false;
+  const data = await cloudGet();
+  if(data && (data.updatedAt||0) > (state.updatedAt||0)){
+    state = normalize(data);
+    if(!getClass(ui.classId)) ui.classId = state.classes[0] && state.classes[0].id;
+    saveLocal(); ensureDay();
+    if(rerender) render();
+    cloudLastSync=Date.now();
+    return true;
+  }
+  return false;
+}
+async function cloudInit(){
+  if(!cloudEnabled){ cloudSetStatus("off"); return; }
+  cloudSetStatus("connecting");
+  try{
+    const data = await cloudGet();
+    if(data){
+      // Publik vy tar alltid molnets version. Admin behåller sin om den är nyare.
+      if(!isAdmin() || (data.updatedAt||0) >= (state.updatedAt||0)){ state=normalize(data); if(!getClass(ui.classId)) ui.classId=state.classes[0]&&state.classes[0].id; saveLocal(); ensureDay(); render(); }
+      else { await cloudPut(state); }   // admin och vår lokala är nyare – skicka upp den
+    } else if(isAdmin()){
+      await cloudPut(state);            // molnet är tomt – admins data blir grunddata (publik skriver aldrig)
+    }
+    cloudLastSync=Date.now(); cloudSetStatus("ok");
+    cloudStartPolling();
+  }catch(e){ cloudSetStatus("offline"); setTimeout(cloudInit, 8000); }   // försök igen senare
+}
+function cloudStartPolling(){
+  if(_polling || !cloudEnabled) return; _polling=true;
+  setInterval(async ()=>{
+    if(cloudStatus==="saving") return;
+    // Stör inte medan man skriver i ett fält.
+    const ae=document.activeElement, tag=ae&&ae.tagName;
+    if(tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT") return;
+    try{ const changed=await cloudPull(true); if(cloudStatus!=="ok") cloudSetStatus("ok"); if(changed) cloudLastSync=Date.now(); }
+    catch(e){ cloudSetStatus("offline"); }
+  }, 12000);
+}
+async function cloudForcePush(){
+  if(!cloudEnabled || !isAdmin()) return;   // publik vy skriver aldrig
+  cloudSetStatus("saving");
+  try{ state.updatedAt=Date.now(); saveLocal(); await cloudPut(state); cloudLastSync=Date.now(); cloudSetStatus("ok"); }
+  catch(e){ cloudSetStatus("offline"); }
+}
+async function cloudForcePull(){
+  if(!cloudEnabled) return;
+  cloudSetStatus("connecting");
+  try{
+    const data=await cloudGet();
+    if(data){ state=normalize(data); if(!getClass(ui.classId)) ui.classId=state.classes[0]&&state.classes[0].id; saveLocal(); ensureDay(); render(); }
+    cloudLastSync=Date.now(); cloudSetStatus("ok");
+  }catch(e){ cloudSetStatus("offline"); }
+}
+// Felsökning: testar läsning + skrivning mot Supabase och förklarar vad som är fel.
+async function cloudDiagnose(){
+  const out=[];
+  out.push("URL: "+SUPA_URL);
+  out.push(`anon-nyckel: …${SUPA_KEY.slice(-6)} (längd ${SUPA_KEY.length} tecken)`);
+  out.push("Delad nyckel (rad): "+TOURN_KEY);
+  out.push("Sidans adress: "+location.origin);
+  out.push("");
+  if(!cloudEnabled){ out.push("❌ Molnsynk är inte aktiverad – URL eller nyckel saknas i filen."); return out.join("\n"); }
+  const interpret=(status,body)=>{
+    const b=(body||"").toLowerCase();
+    if(status===401||status===403){
+      if(b.includes("row-level security")||b.includes("42501")) return "→ RLS-policy saknas/blockerar. Kör SQL:en som ger 'anon' läs- OCH skrivrätt (se instruktionen).";
+      if(b.includes("api key")||b.includes("apikey")) return "→ API-nyckeln saknas eller är fel. Kopiera 'anon public' på nytt från Supabase → Project Settings → API.";
+      if(b.includes("jwt")||b.includes("expired")||b.includes("invalid")) return "→ Nyckeln är ogiltig eller utgången. Hämta en ny 'anon public'-nyckel.";
+      return "→ Behörighet nekad (oftast RLS-policy som saknas, eller fel nyckel).";
+    }
+    if(status===404) return "→ 404. Kontrollera att URL:en slutar på /rest/v1 och att tabellen 'tournaments' finns.";
+    if(status===0) return "→ Ingen kontakt. Internet nere, fel URL, eller nätverket/brandväggen blockerar supabase.co (CORS).";
+    if(b.includes("does not exist")||b.includes("42p01")) return "→ Tabellen 'tournaments' saknas. Skapa den med SQL:en i instruktionen.";
+    if((b.includes("could not find")&&b.includes("column"))||(b.includes("column")&&b.includes("does not exist"))) return "→ Fel/saknad kolumn. Tabellen ska ha exakt kolumnerna 'key' (text) och 'data' (jsonb).";
+    if(status===400){
+      if(b.includes("no unique or exclusion")||b.includes("42p10")) return "→ 'key' saknar unik constraint. Appen är nu uppdaterad för att inte kräva det – ladda om sidan (Ctrl/Cmd+Shift+R).";
+      if(b.includes("not-null")||b.includes("23502")) return "→ En obligatorisk kolumn saknar värde. Ta bort extra NOT NULL-kolumner, eller använd bara 'key' och 'data'.";
+      return "→ Felaktig begäran (400). Vanligast: tabellen har fel kolumner. Den ska ha 'key' (text) och 'data' (jsonb). Se SQL:en i instruktionen.";
+    }
+    return "→ Oväntat svar – se texten ovan.";
+  };
+  // 1) LÄSNING
+  try{
+    const r=await fetch(`${SUPA_URL}/tournaments?key=eq.${encodeURIComponent(TOURN_KEY)}&select=key`, { headers: cloudHeaders() });
+    const body=await r.text();
+    if(r.ok){ out.push(`✅ LÄSNING OK (HTTP ${r.status}).`); }
+    else { out.push(`❌ LÄSNING misslyckades: HTTP ${r.status}`); out.push("  "+body.slice(0,180)); out.push("  "+interpret(r.status,body)); return out.join("\n"); }
+  }catch(e){ out.push("❌ LÄSNING: ingen kontakt med servern – "+e.message); out.push("  "+interpret(0,"")); return out.join("\n"); }
+  // 2) SKRIVNING (testrad med egen nyckel – rör inte turneringsdatan). Samma metod som appen (PATCH→INSERT).
+  try{
+    await cloudUpsertRow("__diag_test__", { ts:Date.now() });
+    out.push("✅ SKRIVNING OK.");
+    out.push("");
+    out.push("🎉 Allt fungerar! Tabellen finns och behörigheten är rätt.");
+    out.push("Om det ändå står Offline: ladda om sidan.");
+    try{ await fetch(`${SUPA_URL}/tournaments?key=eq.__diag_test__`, { method:"DELETE", headers: cloudHeaders() }); }catch(e){}   // städa bort testraden
+  }catch(e){
+    out.push("❌ SKRIVNING misslyckades: "+(e.message||e));
+    if(e.body) out.push("  "+String(e.body).slice(0,180));
+    out.push("  "+interpret(e.status||0, e.body||e.message||""));
+  }
+  return out.join("\n");
+}
+function cloudStatusText(){
+  if(!cloudEnabled) return L("Molnsynk av (endast denna enhet)","Cloud sync off (this device only)");
+  const map={ connecting:L("Ansluter…","Connecting…"), saving:L("Sparar till molnet…","Saving to cloud…"),
+    ok:L("Synkad","Synced"), offline:L("Offline – sparat lokalt","Offline – saved locally"), off:L("Av","Off") };
+  let s=map[cloudStatus]||cloudStatus;
+  if(cloudStatus==="ok" && cloudLastSync){ const d=new Date(cloudLastSync); const p=n=>String(n).padStart(2,"0"); s+=` ${p(d.getHours())}:${p(d.getMinutes())}`; }
+  if(cloudStatus==="offline" && cloudLastError){ s+=` (${cloudLastError.split(" – ")[0]})`; }   // t.ex. "HTTP 401"
+  return s;
+}
+// Välj svart eller vit text som syns bäst mot en given bakgrundsfärg (hex).
+function contrastText(bg){
+  let h=String(bg||"").trim().replace(/^#/,"");
+  if(h.length===3) h=h.split("").map(c=>c+c).join("");
+  if(!/^[0-9a-fA-F]{6}$/.test(h)) return "#1a1a1a";
+  const r=parseInt(h.slice(0,2),16), g=parseInt(h.slice(2,4),16), b=parseInt(h.slice(4,6),16);
+  // Relativ luminans (perception) – ljus bakgrund → mörk text, mörk bakgrund → ljus text.
+  const lum=(0.299*r+0.587*g+0.114*b)/255;
+  return lum>0.6 ? "#1a1a1a" : "#ffffff";
+}
+function updateSyncBadge(){
+  const dot={ connecting:"#e0a020", saving:"#e0a020", ok:"#2e9e57", offline:"#c0392b", off:"#999" }[cloudStatus]||"#999";
+  const html=`<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${dot};margin-right:6px;vertical-align:middle"></span><span style="vertical-align:middle">${cloudStatusText()}</span>`;
+  document.querySelectorAll(".js-sync").forEach(el=>{
+    el.innerHTML=html;
+    if(el.id==="syncBadge"){
+      // Huvudets bakgrund = vald bakgrundsfärg, annars standard (--paper, ljus).
+      el.style.color = contrastText(state.bgColor || "#fbf9f1");
+      el.title = cloudEnabled?`Molnsynk: ${TOURN_KEY}`:"Molnsynk av";
+    } else {
+      el.style.color = contrastText("#eee5cf");   // pillens ljusa bakgrund → mörk text
+    }
+  });
+}
 function uid(){ return Math.random().toString(36).slice(2,9); }
 function getClass(id){ return state.classes.find(c=>c.id===id); }
 // Distinkt färg per klass (utifrån klassens ordning) för att skilja matcher åt.
@@ -518,6 +753,16 @@ function findMatchByNumber(no){
   return null;
 }
 function matchNoTag(m){ const n=matchNumber(m); return n==null?"":`<span class="mno">#${n}</span>`; }
+// Etikett för en matchsida: känd deltagare visas med namn, annars matchnumret på
+// matchen vars vinnare fyller platsen (t.ex. "#12" = vinnaren av match 12).
+function slotFeedLabel(cls,m,slot){
+  const p = slot===0 ? m.p1 : m.p2;
+  if(p) return dispName(p);
+  const feeder = (cls && m.round>0 && !m.manual) ? matchOf(cls, m.round-1, m.index*2 + slot) : null;
+  const n = feeder ? matchNumber(feeder) : null;
+  if(n!=null) return `<span class="mno" title="${L('Vinnare av match','Winner of match')} #${n}">#${n}</span>`;
+  return `<span class="muted">?</span>`;
+}
 // Antal riktiga matcher som ska spelas i en klass (deltagare-1 + manuella).
 function realMatchCount(cls){
   return Math.max(0, cls.participants.length-1) + cls.matches.filter(m=>m.manual).length;
@@ -819,6 +1064,7 @@ function applyTheme(){
   document.documentElement.style.setProperty("--head", state.headColor || "#b5362b");
   const lh=document.getElementById("logoHolder");
   if(lh) lh.innerHTML=logoMarkup();
+  updateSyncBadge();   // säkerställ att statustexten kontrasterar mot vald bakgrund
 }
 
 /* ---------------- Rendering ---------------- */
@@ -827,6 +1073,10 @@ const app=document.getElementById("app");
 function render(){
   ensureDay();
   applyTheme();
+  updateAdminBtn();
+  document.body.classList.toggle("public", !isAdmin());
+  // Publik läsvy får bara vara på Turneringsinformation, Stege, Schema eller Sök deltagare.
+  if(!isAdmin() && !["info","bracket","schedule","psearch"].includes(ui.tab)) ui.tab="bracket";
   document.title = `${state.tournament.name||"Klubbmästerskap"} – ${arrangerName()}`;
   document.getElementById("appTitle").textContent = state.tournament.name || "Klubbmästerskap";
   document.getElementById("appSub").textContent = `${arrangerName()} · ${tournamentRangeText()}`;
@@ -835,6 +1085,7 @@ function render(){
   else if(ui.tab==="classes") renderClasses();
   else if(ui.tab==="bracket") renderBracketTab();
   else if(ui.tab==="schedule") renderSchedule();
+  else if(ui.tab==="psearch") renderPlayerSearch();
   else if(ui.tab==="requests") renderRequests();
   else if(ui.tab==="planner") renderPlanner();
   else if(ui.tab==="participants") renderParticipants();
@@ -844,7 +1095,10 @@ function render(){
   applyLang();   // översätt gränssnittet till engelska om valt
 }
 function renderTabs(){
-  const tabs=[["info","Turneringsinformation"],["classes","Klasser & deltagare"],["bracket","Stege"],["schedule","Schema"],["requests","Önskemål"],["planner","Auto-planering"],["participants","Deltagarlista"],["print","Resultat & utskrift"],["stats","Statistik"],["about","Om appen"]];
+  const all=[["info","Turneringsinformation"],["classes","Klasser & deltagare"],["bracket","Stege"],["schedule","Schema"],["requests","Önskemål"],["planner","Auto-planering"],["participants","Deltagarlista"],["print","Resultat & utskrift"],["stats","Statistik"],["about","Om appen"]];
+  // Publik läsvy: Turneringsinformation + Stege + Schema + Sök deltagare (skrivskyddat).
+  const publicTabs=[["info","Turneringsinformation"],["bracket","Stege"],["schedule","Schema"],["psearch","Sök deltagare"]];
+  const tabs = isAdmin() ? all : publicTabs;
   document.getElementById("tabs").innerHTML=tabs.map(([k,l])=>
     `<button class="${ui.tab===k?'active':''}" data-tab="${k}">${l}</button>`).join("");
   document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{ui.tab=b.dataset.tab;render();});
@@ -993,12 +1247,32 @@ function renderAbout(){
      </ul>
      <h3 style="color:var(--head)">${L('Säkerhetskopiering','Backup')}</h3>
      <p class="small">${L('Under <b>Turneringsinformation</b> använder du <b>Exportera säkerhetskopia</b> för att spara en JSON-fil (filnamnet får datum + klockslag), och <b>Importera säkerhetskopia</b> för att återställa eller flytta turneringen till en annan dator.','Under <b>Tournament info</b> you use <b>Export backup</b> to save a JSON file (the filename gets date + time), and <b>Import backup</b> to restore or move the tournament to another computer.')}</p>
+     <h3 style="color:var(--head)">${L('Anslutningsstatus (molnsynk)','Connection status (cloud sync)')}</h3>
+     <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+       <span id="syncBadge3" class="pill js-sync"></span>
+       <button class="btn ghost mini" id="aboutPullBtn" ${cloudEnabled?'':'disabled'}>⬇ ${L('Hämta från molnet','Fetch from cloud')}</button>
+       <button class="btn ghost mini" id="aboutPushBtn" ${cloudEnabled?'':'disabled'}>⬆ ${L('Spara till molnet nu','Save to cloud now')}</button>
+       <button class="btn mini" id="aboutDiagBtn" ${cloudEnabled?'':'disabled'}>🔍 ${L('Testa anslutning','Test connection')}</button>
+     </div>
+     <pre id="cloudDiagOut" style="display:none;white-space:pre-wrap;background:#f6f3ea;border:1px solid var(--line);border-radius:8px;padding:10px;margin-top:10px;font-size:12px;color:#26211c;max-height:320px;overflow:auto"></pre>
+     <p class="small muted" style="margin:6px 0 0">${cloudEnabled
+        ? L(`Turneringen delas mellan alla enheter via molnet (delad nyckel <b>${TOURN_KEY}</b>). Grön prick = synkad, gul = ansluter/sparar, röd = offline (då sparas allt lokalt tills anslutningen är tillbaka).`,`The tournament is shared between all devices via the cloud (shared key <b>${TOURN_KEY}</b>). Green dot = synced, amber = connecting/saving, red = offline (everything is saved locally until the connection returns).`)
+        : L('Molnsynk är inte konfigurerad i denna fil – appen sparar endast lokalt i denna webbläsare.','Cloud sync is not configured in this file – the app saves only locally in this browser.')}</p>
      <hr style="border:none;border-top:1px solid var(--line);margin:16px 0">
      <p class="small muted">
        <b>${L('Version (denna sidas senaste ändring):','Version (this page\'s last change):')}</b> ${appVersionText()}<br>
        ${arrangerName()} · ${L('fristående webbapp (index.html).','standalone web app (index.html).')}
      </p>
    </div>`;
+  updateSyncBadge();
+  { const b=document.getElementById("aboutPullBtn"); if(b) b.onclick=cloudForcePull; }
+  { const b=document.getElementById("aboutPushBtn"); if(b) b.onclick=cloudForcePush; }
+  { const b=document.getElementById("aboutDiagBtn"); if(b) b.onclick=async ()=>{
+      const out=document.getElementById("cloudDiagOut");
+      out.style.display="block"; out.textContent=L("Testar…","Testing…");
+      try{ out.textContent=await cloudDiagnose(); }catch(e){ out.textContent="Fel: "+e.message; }
+      updateSyncBadge();
+    }; }
 }
 
 // Läs in en uppladdad logga; rasterbilder skalas ned (max 512 px), SVG behålls som vektor.
@@ -1025,18 +1299,10 @@ function loadLogoFile(file){
 
 /* ----- Tab: Turneringsinformation (första fliken) ----- */
 function renderInfo(){
+  if(!isAdmin()){ renderInfoPublic(); return; }   // publik: skrivskyddad översikt
   const t=state.tournament, o=state.organizer||{};
   const esc=s=>String(s==null?"":s).replace(/"/g,"&quot;");
   app.innerHTML=`
-   <div class="card no-print">
-     <h2>Språk / Language</h2>
-     <label class="small">Språk / Language:
-       <select id="langSel">
-         <option value="sv" ${state.lang!=="en"?"selected":""}>Svenska</option>
-         <option value="en" ${state.lang==="en"?"selected":""}>English</option>
-       </select>
-     </label>
-   </div>
    <div class="card no-print">
      <h2>Turnering</h2>
      <p class="small muted">Namn, datum och antal banor för turneringen. Dagar och veckodagar i schemat skapas utifrån datumintervallet.</p>
@@ -1057,6 +1323,28 @@ function renderInfo(){
        <span class="pill">${tournamentRangeText()}</span>
        <span class="muted">&nbsp;Finaler för ungdomsklasser näst sista dagen, övriga sista dagen. Banantalet kan justeras per dag i Schema/Auto-planering.</span>
      </p>
+   </div>
+   <div style="display:flex;gap:16px;align-items:stretch;flex-wrap:wrap">
+     <div class="card no-print" style="flex:1 1 320px;min-width:280px">
+       <h2>${L('Molnsynk','Cloud sync')}</h2>
+       <p class="small muted">${L('När molnsynk är på delas turneringen automatiskt mellan alla enheter som öppnar sidan – ändringar sparas till molnet och hämtas var 12:e sekund. Lokal kopia sparas alltid som backup.','When cloud sync is on, the tournament is shared automatically between all devices that open the page – changes are saved to the cloud and fetched every 12 s. A local copy is always kept as backup.')}</p>
+       <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+         <span id="syncBadge2" class="pill js-sync"></span>
+         <button class="btn ghost mini" id="cloudPullBtn" ${cloudEnabled?'':'disabled'}>⬇ ${L('Hämta från molnet','Fetch from cloud')}</button>
+         <button class="btn ghost mini" id="cloudPushBtn" ${cloudEnabled?'':'disabled'}>⬆ ${L('Spara till molnet nu','Save to cloud now')}</button>
+         <span class="muted small">${L('Delad nyckel','Shared key')}: <b>${TOURN_KEY}</b></span>
+       </div>
+       ${cloudEnabled?'':`<p class="small" style="color:#c0392b">${L('Molnsynk är inte konfigurerad i denna fil.','Cloud sync is not configured in this file.')}</p>`}
+     </div>
+     <div class="card no-print" style="flex:1 1 320px;min-width:280px">
+       <h2>Säkerhetskopia</h2>
+       <p class="small muted">Spara hela turneringen som en JSON-fil (filnamnet får datum + klockslag), eller läs in en tidigare kopia
+         för att återställa eller flytta turneringen till en annan dator.</p>
+       <div class="row">
+         <button class="btn ghost" id="exportBtn">⬇ Exportera säkerhetskopia</button>
+         <button class="btn ghost" id="importBtn">⬆ Importera säkerhetskopia</button>
+       </div>
+     </div>
    </div>
    <div class="card no-print">
      <h2>Logga &amp; bakgrund</h2>
@@ -1152,13 +1440,23 @@ function renderInfo(){
      <textarea id="venue" placeholder="T.ex. Dalarö Tennisklubb, Odinsvägen 5, 137 70 Dalarö" style="min-height:64px">${String(state.venue||"")}</textarea>
    </div>
    <div class="card no-print">
-     <h2>Säkerhetskopia</h2>
-     <p class="small muted">Spara hela turneringen som en JSON-fil (filnamnet får datum + klockslag), eller läs in en tidigare kopia
-       för att återställa eller flytta turneringen till en annan dator.</p>
-     <div class="row">
-       <button class="btn ghost" id="exportBtn">⬇ Exportera säkerhetskopia</button>
-       <button class="btn ghost" id="importBtn">⬆ Importera säkerhetskopia</button>
+     <h2>${L('Admin-PIN (publik/dold vy)','Admin PIN (public/hidden view)')}</h2>
+     <p class="small muted">${L('Publika delen visar bara Turneringsinformation, Stege och Schema – utan möjlighet att ändra. Admin låses upp med denna PIN (knappen 🔒 Admin uppe till höger). Byt gärna till en egen kod.','The public part shows only Tournament info, Bracket and Schedule – with no editing. Admin is unlocked with this PIN (the 🔒 Admin button top right). Change it to your own code.')}</p>
+     <div class="row" style="align-items:flex-end;gap:10px;flex-wrap:wrap">
+       <label class="small">${L('Admin-PIN','Admin PIN')}<br>
+         <input type="text" id="adminPinInput" value="${String(adminPin()).replace(/"/g,'&quot;')}" style="width:140px" autocomplete="off"></label>
+       <button class="btn mini" id="savePinBtn">💾 ${L('Spara PIN','Save PIN')}</button>
+       <span class="muted small">${L('Synkas till alla enheter. Obs: enkel spärr – koden går att hitta för tekniskt kunniga.','Synced to all devices. Note: simple protection – the code can be found by technical users.')}</span>
      </div>
+   </div>
+   <div class="card no-print">
+     <h2>Språk / Language</h2>
+     <label class="small">Språk / Language:
+       <select id="langSel">
+         <option value="sv" ${state.lang!=="en"?"selected":""}>Svenska</option>
+         <option value="en" ${state.lang==="en"?"selected":""}>English</option>
+       </select>
+     </label>
    </div>
    <div class="card no-print">
      <h2>Nollställ</h2>
@@ -1209,6 +1507,17 @@ function renderInfo(){
   document.getElementById("exportBtn").onclick=exportBackup;
   document.getElementById("importBtn").onclick=()=>document.getElementById("importFile").click();
   document.getElementById("newTournament").onclick=resetEverything;
+  // Admin-PIN
+  { const b=document.getElementById("savePinBtn"); if(b) b.onclick=()=>{
+      const v=document.getElementById("adminPinInput").value.trim();
+      if(!v){ alert(L("PIN får inte vara tom.","PIN cannot be empty.")); return; }
+      state.adminPin=v; save();
+      alert(L("Admin-PIN sparad och synkad.","Admin PIN saved and synced."));
+    }; }
+  // Molnsynk
+  updateSyncBadge();
+  { const b=document.getElementById("cloudPullBtn"); if(b) b.onclick=cloudForcePull; }
+  { const b=document.getElementById("cloudPushBtn"); if(b) b.onclick=cloudForcePush; }
   // Tränare
   document.getElementById("addTrainer").onclick=()=>{ state.trainers.push(""); save(); render(); };
   document.querySelectorAll("#trainerList input[data-tr]").forEach(el=>el.oninput=()=>{ state.trainers[+el.dataset.tr]=el.value; save(); });
@@ -1229,6 +1538,116 @@ function renderInfo(){
     Object.assign(state.sched, set); save(); render();
   };
   document.getElementById("resetSched").onclick=()=>{ if(confirm(L("Återställ schemaläggningen till standard?","Reset scheduling to default?"))){ state.sched=defaultSched(); save(); render(); } };
+}
+// Publik (skrivskyddad) version av Turneringsinformation – bara visning, inga kontroller.
+function renderInfoPublic(){
+  const t=state.tournament||{}, o=state.organizer||{};
+  const esc=s=>String(s==null?"":s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const rows=[];
+  const add=(label,val)=>{ if(val && String(val).trim()) rows.push(`<tr><th style="text-align:left;padding:4px 14px 4px 0;vertical-align:top;white-space:nowrap;color:#6b6356;font-weight:600">${label}</th><td style="padding:4px 0">${esc(val)}</td></tr>`); };
+  add(L('Turnering','Tournament'), t.name);
+  add(L('Arrangör','Organizer'), state.arranger);
+  add(L('Datum','Dates'), tournamentRangeText());
+  add(L('Antal banor','Courts'), state.courts);
+  add(L('Spelplats','Venue'), state.venue);
+  add(L('Kontaktperson','Contact'), o.name);
+  add(L('Telefon','Phone'), o.phone);
+  add(L('E-post','Email'), o.email);
+  add(L('Ordförande','Chairman'), state.chairman);
+  const trainers=(state.trainers||[]).filter(x=>x&&x.trim());
+  if(trainers.length) add(trainers.length>1?L('Tränare','Trainers'):L('Tränare','Trainer'), trainers.join(", "));
+  app.innerHTML=`
+   <div class="hint no-print">
+     👁 <b>${L('Publik läsvy','Public view')}</b> – ${L('turneringsinformationen visas skrivskyddat.','tournament information shown read-only.')}
+   </div>
+   <div class="card">
+     <div class="row" style="align-items:center;gap:14px">
+       <div style="width:56px;height:56px;flex:0 0 auto">${logoMarkup()}</div>
+       <div>
+         <h2 style="margin:0">${esc(t.name||'Klubbmästerskap')}</h2>
+         <p class="small muted" style="margin:2px 0 0">${esc(state.arranger||'')} · ${tournamentRangeText()}</p>
+       </div>
+     </div>
+     <table style="margin-top:14px;border-collapse:collapse">${rows.join("")}</table>
+     <div class="row" style="margin-top:14px;align-items:center;gap:10px;flex-wrap:wrap">
+       <span id="syncBadge2" class="pill js-sync"></span>
+       <span class="muted small">${L('Öppna admin (🔒 uppe till höger) för att ändra.','Open admin (🔒 top right) to make changes.')}</span>
+     </div>
+   </div>`;
+  updateSyncBadge();
+}
+// Publik "Sök deltagare": klasser, schemalagda matcher och resultat för en person.
+function renderPlayerSearch(){
+  const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const nameOnSide=(side,name)=> side!=null && String(side).split("/").some(pp=>stripRank(pp)===name);
+  const q=(ui.psearch||"").trim().toLowerCase();
+  const idx=participantIndex("");                        // alla synliga klasser
+  const matched = q ? idx.filter(r=>r.name.toLowerCase().includes(q)) : [];
+  let html=`
+   <div class="hint no-print">
+     👁 <b>${L('Sök deltagare','Player search')}</b> – ${L('skriv ett namn för att se klasser, schemalagda matcher och resultat.','type a name to see classes, scheduled matches and results.')}
+   </div>
+   <div class="card">
+     <h2>${L('Sök deltagare','Player search')}</h2>
+     <div class="row">
+       <input type="text" id="pSearchInput" placeholder="🔎 ${L('Skriv ett namn…','Type a name…')}" value="${esc(ui.psearch||'')}" style="min-width:240px">
+       ${q?`<button class="btn ghost mini" id="pClr">✕ ${L('Rensa','Clear')}</button>`:''}
+       <span class="pill">${idx.length} ${L('deltagare totalt','players total')}</span>
+     </div>
+   </div>`;
+  if(!q){
+    html+=`<div class="card"><p class="muted">${L('Skriv ett namn i sökrutan ovan för att söka.','Type a name in the search box above.')}</p></div>`;
+  } else if(!matched.length){
+    html+=`<div class="card"><p class="muted">${L('Ingen deltagare matchar','No player matches')} "${esc(ui.psearch)}".</p></div>`;
+  } else {
+    for(const r of matched){
+      const pm=playerMatches(r.name,"");
+      const played=pm.filter(x=>x.m.winner);
+      const wins=played.filter(x=>nameOnSide(x.m.winner,r.name)).length;
+      const losses=played.length-wins;
+      html+=`<div class="card">
+        <h2 style="margin:0 0 6px">${esc(r.name)}</h2>
+        <div class="row" style="gap:6px;margin:0 0 4px">
+          <span class="small muted">${L('Anmäld i','Registered in')}:</span>
+          ${r.classes.map(cn=>`<span class="pill">${esc(cn)}</span>`).join("")}
+        </div>
+        ${played.length?`<p class="small" style="margin:6px 0 10px">${L('Spelade matcher','Played matches')}: <b>${played.length}</b> · <span style="color:var(--green)">${wins} ${L('vinster','wins')}</span> · ${losses} ${L('förluster','losses')}</p>`:''}`;
+      if(!pm.length){
+        html+=`<p class="small muted">${L('Inga matcher ännu.','No matches yet.')}</p></div>`;
+        continue;
+      }
+      html+=`<div style="overflow-x:auto"><table class="results"><thead><tr>
+          <th>${L('Nr','No')}</th><th>${L('Klass','Class')}</th><th>${L('Omgång','Round')}</th>
+          <th>${L('Dag','Day')}</th><th>${L('Tid','Time')}</th><th>${L('Bana','Court')}</th>
+          <th>${L('Motståndare','Opponent')}</th><th>${L('Resultat','Result')}</th></tr></thead><tbody>`;
+      for(const {m,c} of pm){
+        const oppSide = nameOnSide(m.p1,r.name) ? m.p2 : m.p1;
+        const opp = oppSide!=null ? esc(dispName(oppSide)) : `<i style="color:#b3aa98">${L('väntar på motståndare','awaiting opponent')}</i>`;
+        let result;
+        if(m.winner){
+          const won=nameOnSide(m.winner,r.name);
+          result=`${esc(m.score||'WO')} · ${won?`<b style="color:var(--green)">✅ ${L('vinst','win')}</b>`:`<span class="muted">${L('förlust','loss')}</span>`}`;
+        } else {
+          result=`<span class="muted">${m.day?L('kommande','upcoming'):'–'}</span>`;
+        }
+        html+=`<tr>
+          <td>${matchNumber(m)??'-'}</td>
+          <td><span class="cdot" style="background:${classColor(c)}"></span>${esc(c.name)}</td>
+          <td class="small">${m.manual?L('match','match'):esc(roundName(m.round,totalRounds(c)))}</td>
+          <td>${m.day?esc(dayShort(m.day)):`<i>${L('ej schemalagd','not scheduled')}</i>`}</td>
+          <td>${m.time!=null?matchLabel(m):'-'}</td>
+          <td>${m.court||'-'}</td>
+          <td>${opp}</td>
+          <td>${result}</td></tr>`;
+      }
+      html+=`</tbody></table></div></div>`;
+    }
+  }
+  app.innerHTML=html;
+  const si=document.getElementById("pSearchInput");
+  si.oninput=e=>{ ui.psearch=e.target.value; ui._psf=true; render(); };
+  if(ui._psf){ const el=document.getElementById("pSearchInput"); if(el){ el.focus(); el.setSelectionRange(el.value.length,el.value.length); } ui._psf=false; }
+  const clr=document.getElementById("pClr"); if(clr) clr.onclick=()=>{ ui.psearch=""; ui._psf=true; render(); };
 }
 
 /* ----- Tab 1: Klasser & deltagare ----- */
@@ -1269,14 +1688,25 @@ function renderClasses(){
        <button class="btn ghost mini" id="hideClsBtn">${cls.hidden?'👁 Visa klass':'🙈 Dölj klass'}</button>
        <button class="btn gray mini" id="deleteClsBtn">🗑 Ta bort klass</button>
      </div>
-     <div class="row" style="margin:0 0 10px;align-items:flex-end;gap:10px;flex-wrap:wrap">
+     <div class="row" style="margin:0 0 10px;align-items:flex-end;gap:14px;flex-wrap:wrap">
        <label class="small">${L('Kategori','Category')}<br>
          <select id="clsCategory">${CLASS_CATEGORIES.map(([v,lbl])=>`<option value="${v}" ${cls.category===v?'selected':''}>${lbl}</option>`).join("")}</select></label>
        <label class="small">${L('Åldersnivå','Age level')}<br>
          <input type="text" id="clsAge" value="${String(cls.ageLevel||'').replace(/"/g,'&quot;')}" placeholder="${L('t.ex. U12, 40+, Öppen','e.g. U12, 40+, Open')}" style="min-width:150px"></label>
        <label class="small">${L('Typ (schema)','Type (schedule)')}<br>
          <select id="clsType"><option value="adult" ${cls.type!=='youth'?'selected':''}>${L('Senior','Senior')}</option><option value="youth" ${cls.type==='youth'?'selected':''}>${L('Junior','Junior')}</option></select></label>
+       <label class="small">${L('Klassindex','Class index')}<br>
+         <input type="number" id="catNo" min="1" max="99" value="${classCatNo(cls)}" style="width:64px"></label>
+       <label class="small" style="align-self:flex-end;padding-bottom:6px">
+         <input type="checkbox" id="rankToggle" ${isRanked(cls)?'checked':''}>
+         <b>${L('Seeda denna klass','Seed this class')}</b> ·
+         <select id="seedCount" ${isRanked(cls)?'':'disabled'}>
+           ${[2,4,8,16,32].map(n=>`<option value="${n}" ${(cls.seeds||4)===n?'selected':''}>${n}</option>`).join("")}
+         </select>
+         (${L('rank','rank')} 1–${seedCountOf(cls)||4})
+       </label>
      </div>
+     <p class="small muted" style="margin:-4px 0 10px">${L('Matcher numreras','Matches numbered')} <b>${classCatNo(cls)}01, ${classCatNo(cls)}02 …</b></p>
      <div class="hint">
        Klistra in deltagare – <b>en rad per deltagare</b>. För dubbelklasser: skriv paret på en rad,
        t.ex. <i>Anna Andersson / Björn Berg</i>.
@@ -1285,23 +1715,18 @@ function renderClasses(){
          : 'Lottningen är helt slumpmässig (ingen seedning).'}
        När du låser deltagarna byggs stegen utifrån listan.
      </div>
-     <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">
-       <div style="flex:1;min-width:300px">
-         <label class="small" style="display:block;margin:0 0 10px">
-           <input type="checkbox" id="rankToggle" ${isRanked(cls)?'checked':''}>
-           <b>Seeda denna klass</b> &nbsp;·&nbsp; antal seedade:
-           <select id="seedCount" ${isRanked(cls)?'':'disabled'}>
-             ${[2,4,8,16,32].map(n=>`<option value="${n}" ${(cls.seeds||4)===n?'selected':''}>${n}</option>`).join("")}
-           </select>
-           (rank 1–${seedCountOf(cls)||4})
-         </label>
-         <label class="small" style="display:block;margin:0 0 10px">
-           ${L('Klassindex','Class index')}:
-           <input type="number" id="catNo" min="1" max="99" value="${classCatNo(cls)}" style="width:60px">
-           – ${L('matcher numreras','matches numbered')} <b>${classCatNo(cls)}01, ${classCatNo(cls)}02 …</b>
-         </label>
-         <textarea id="partsInput" placeholder="Anna Andersson&#10;Björn Berg&#10;Carl Carlsson&#10;...">${cls.participants.join("\n")}</textarea>
-         <div class="toolbar" style="margin-top:10px">
+     <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:stretch">
+       <div style="flex:0 0 260px;min-width:230px;display:flex;flex-direction:column">
+         <div class="small" style="margin-bottom:6px"><b>${L('Lägg till befintliga deltagare','Add existing players')}</b></div>
+         <input type="text" id="existSearch" placeholder="🔎 ${L('Sök namn…','Search name…')}" style="width:100%" ${existNames.length?'':'disabled'}>
+         <button class="btn mini" id="addExistBtn" style="margin-top:6px;width:100%" ${existNames.length?'':'disabled'}>➕ ${L('Lägg till valda i rutan','Add selected to the box')}</button>
+         <p class="muted small" style="margin:6px 0 6px">${L('– namn som redan är registrerade i andra klasser','– names already registered in other classes')}</p>
+         ${existNames.length?`<div id="existListWrap" style="height:300px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px;margin-top:auto">
+           ${existNames.map(n=>`<label class="small" style="display:block;padding:2px 4px" data-existrow="${n.toLowerCase().replace(/"/g,'&quot;')}"><input type="checkbox" class="existchk" value="${n.replace(/"/g,'&quot;')}"> ${n}</label>`).join("")}
+         </div>`:`<p class="small muted" style="margin-top:auto">(${L('inga andra deltagare registrerade','no other players registered')})</p>`}
+       </div>
+       <div style="flex:1;min-width:300px;display:flex;flex-direction:column">
+         <div class="toolbar" style="margin-bottom:10px">
            <button class="btn" id="saveParts">🔒 Lås deltagare &amp; bygg stege</button>
            <span class="pill">${cls.participants.length} deltagare</span>
            ${cls.matches.length?`<span class="pill">${totalRounds(cls)} omgångar</span>`:""}
@@ -1309,26 +1734,18 @@ function renderClasses(){
            <span style="flex:1"></span>
            <button class="btn gray mini" id="clearParts" ${cls.participants.length?'':'disabled'}>🗑 Rensa deltagare (raderar stegen)</button>
          </div>
-       </div>
-       <div style="flex:0 0 260px;min-width:230px">
-         <div class="small" style="margin-bottom:6px"><b>${L('Lägg till befintliga deltagare','Add existing players')}</b></div>
-         <input type="text" id="existSearch" placeholder="🔎 ${L('Sök namn…','Search name…')}" style="width:100%" ${existNames.length?'':'disabled'}>
-         <button class="btn mini" id="addExistBtn" style="margin-top:6px;width:100%" ${existNames.length?'':'disabled'}>➕ ${L('Lägg till valda i rutan','Add selected to the box')}</button>
-         ${existNames.length?`<div id="existListWrap" style="max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px;margin-top:6px">
-           ${existNames.map(n=>`<label class="small" style="display:block;padding:2px 4px" data-existrow="${n.toLowerCase().replace(/"/g,'&quot;')}"><input type="checkbox" class="existchk" value="${n.replace(/"/g,'&quot;')}"> ${n}</label>`).join("")}
-         </div>`:`<p class="small muted" style="margin:6px 0 0">(${L('inga andra deltagare registrerade','no other players registered')})</p>`}
-         <p class="muted small" style="margin:6px 0 0">${L('– namn som redan är registrerade i andra klasser','– names already registered in other classes')}</p>
+         ${cls.participants.length?`
+         <div class="row" style="margin-bottom:10px;align-items:center;flex-wrap:wrap">
+           <span class="small">Ersätt deltagare:</span>
+           <select id="replSel">${cls.participants.map(p=>`<option value="${String(p).replace(/"/g,'&quot;')}">${dispName(p)}</option>`).join("")}</select>
+           <span class="small">med</span>
+           <input type="text" id="replNew" placeholder="nytt namn / par" style="min-width:150px">
+           <button class="btn mini" id="replBtn">🔁 Ersätt</button>
+           <span class="muted small">– tar den gamlas plats i stege och schema.</span>
+         </div>`:''}
+         <textarea id="partsInput" style="height:300px;margin-top:auto" placeholder="Anna Andersson&#10;Björn Berg&#10;Carl Carlsson&#10;...">${cls.participants.join("\n")}</textarea>
        </div>
      </div>
-     ${cls.participants.length?`
-     <div class="row" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
-       <span class="small">Ersätt deltagare:</span>
-       <select id="replSel">${cls.participants.map(p=>`<option value="${String(p).replace(/"/g,'&quot;')}">${dispName(p)}</option>`).join("")}</select>
-       <span class="small">med</span>
-       <input type="text" id="replNew" placeholder="nytt namn / par" style="min-width:180px">
-       <button class="btn mini" id="replBtn">🔁 Ersätt</button>
-       <span class="muted small">– den nya tar den gamlas plats i stege och schema.</span>
-     </div>`:''}
    </div>`;
   // grid
   document.getElementById("clsGrid").innerHTML=[...state.classes].sort((a,b)=>(a.catNo||0)-(b.catNo||0)).map(c=>{
@@ -1407,12 +1824,14 @@ function renderClasses(){
   document.getElementById("clearOneBrSched").onclick=()=>clearBracketOf(cls);
 }
 // Rensar HELA appen: deltagare, stegar, scheman, datum. Används av båda nollställ-knapparna.
-function resetEverything(){
+async function resetEverything(){
   if(!confirm("Ny turnering – nollställ ALLT (deltagare, stegar och scheman i alla klasser)? Detta kan inte ångras.")) return;
   // Robust nollställning: rensa lagringen och ladda om sidan -> helt färskt tillstånd.
   try{ localStorage.removeItem(LS_KEY); }catch(e){}
-  state=newState();
-  try{ location.reload(); }catch(e){ save(); ui={tab:"classes",classId:state.classes[0].id,day:null}; ensureDay(); render(); }
+  state=newState(); state.updatedAt=Date.now();
+  // Skriv den tomma turneringen till molnet FÖRST (annars hämtas gamla data tillbaka vid omladdning).
+  if(cloudEnabled){ try{ cloudSetStatus("saving"); await cloudPut(state); }catch(e){} }
+  try{ location.reload(); }catch(e){ saveLocal(); cloudSchedulePush(); ui={tab:"classes",classId:state.classes[0].id,day:null}; ensureDay(); render(); }
 }
 // Nollställer stegar OCH scheman (inkl. resultat) i alla klasser men behåller deltagarna
 // i Klasser & deltagare. Stegarna TÖMS (byggs inte om) – deltagarlistorna är kvar och
@@ -1451,7 +1870,7 @@ function renderBracketTab(){
      <div class="row">
        <span class="sw" style="background:${classColor(cls)};width:16px;height:16px;border-radius:4px;display:inline-block"></span>
        <label class="small">Klass:
-         <select id="clsSel">${visibleClasses().map(c=>{ const has=c.matches.some(m=>!m.manual); return `<option value="${c.id}" ${c.id===cls.id?'selected':''}${has?' style="font-weight:bold"':''}>${has?'✅ ':''}${c.name}</option>`; }).join("")}</select>
+         <select id="clsSel">${visibleClasses().slice().sort((a,b)=>(a.catNo||0)-(b.catNo||0)).map(c=>{ const has=c.matches.some(m=>!m.manual); return `<option value="${c.id}" ${c.id===cls.id?'selected':''}${has?' style="font-weight:bold"':''}>${has?'✅ ':''}${c.name} (#${c.catNo})</option>`; }).join("")}</select>
        </label>
        <span class="badge ${cls.type}">${cls.type==='youth'?'Ungdom 9–13':'Senior 13–21'}</span>
        ${isRanked(cls)?`<span class="badge" style="background:#f6efd2;color:#8a6d00">★ Seedas (top ${seedCountOf(cls)})</span>`:''}
@@ -1461,9 +1880,9 @@ function renderBracketTab(){
        ? `<div class="hint" style="border-color:#c9a227;background:#fbf6e3;margin-top:10px">
             ⚠ Denna stege byggdes <b>utan seedning</b>. Klicka <b>🔁 Lotta om / bygg stege</b> för att seeda de ${seedCountOf(cls)} översta (1–${seedCountOf(cls)}).
           </div>` : ''}
-     <p class="small muted" style="margin:8px 0 0">
+     ${isAdmin()?`<p class="small muted" style="margin:8px 0 0">
        Skriv resultatet i rutan och välj <b>vinnare</b> i listan (eller klicka på spelarens namn).
-       Vinnaren förs automatiskt vidare och nästa match blir spelklar i <b>Schema → Ej schemalagda</b>.</p>
+       Vinnaren förs automatiskt vidare och nästa match blir spelklar i <b>Schema → Ej schemalagda</b>.</p>`:''}
      ${ui.swapMode?`<div class="hint" style="border-color:#f0a500;background:#fff8e6;margin-top:10px">
         🔀 <b>${L('Bytesläge på:','Swap mode on:')}</b> ${L('klicka på en spelare och sedan på en annan – de byter plats. Fungerar mellan omgång 1 och omgång 2, även för <b>seedade</b> spelare (en seed som gått vidare på bye byts via sin plats i omgång 2). (Berörda resultat nollställs.)','click a player and then another – they swap places. Works between round 1 and round 2, including <b>seeded</b> players (a seed advanced on a bye is swapped via its slot in round 2). (Affected results are cleared.)')}</div>`:''}
      ${ui.moveMode?`<div class="hint" style="border-color:#2f80c9;background:#eaf4fc;margin-top:10px">
@@ -1471,18 +1890,19 @@ function renderBracketTab(){
      ${ui.numMode?`<div class="hint" style="border-color:#8e44ad;background:#f6eefc;margin-top:10px">
         🔢 <b>${L('Byt matchnummer på:','Swap match number mode on:')}</b> ${L('klicka på en match och sedan på en annan – deras matchnummer byter plats (precis som byte av spelare). Spelare och resultat påverkas inte.','click a match and then another – their match numbers swap (just like swapping players). Players and results are not affected.')}</div>`:''}
      <div class="row" style="margin-top:10px">
+       ${isAdmin()?`
        <button class="btn ${ui.swapMode?'':'ghost'} mini" id="swapMode">🔀 ${L('Byt spelare','Swap players')} ${ui.swapMode?'('+L('på','on')+')':''}</button>
        <button class="btn ${ui.moveMode?'':'ghost'} mini" id="moveMode">↔ ${L('Flytta match','Move match')} ${ui.moveMode?'('+L('på','on')+')':''}</button>
        <button class="btn ${ui.numMode?'':'ghost'} mini" id="numMode">🔢 ${L('Byt matchnummer','Swap match number')} ${ui.numMode?'('+L('på','on')+')':''}</button>
        <button class="btn ghost mini" id="rebuildBr">🔁 Lotta om / bygg stege</button>
-       <button class="btn gray mini" id="clearBr">🗑 Rensa flik (denna stege)</button>
+       <button class="btn gray mini" id="clearBr">🗑 Rensa flik (denna stege)</button>`:''}
        <span style="flex:1"></span>
        <button class="btn ghost mini" id="imgBr">📷 ${L('Spara bild av stege','Save bracket image')}</button>
        <button class="btn ghost mini" id="imgAllBr">📷 ${L('Bild av alla stegar','Image of all brackets')}</button>
        ${cls.champion?`<button class="btn ghost mini" id="diplomaBr">🏅 ${L('Diplom','Diploma')}</button>`:''}
        <button class="btn mini" id="printBr">🖨 Skriv ut stege</button>
      </div>
-     ${cls.participants.length?`
+     ${(isAdmin() && cls.participants.length)?`
      <div class="row" style="margin-top:10px;border-top:1px solid var(--line);padding-top:10px">
        <span class="small">Ersätt deltagare:</span>
        <select id="replSelBr">${cls.participants.map(p=>`<option value="${String(p).replace(/"/g,'&quot;')}">${dispName(p)}</option>`).join("")}</select>
@@ -1494,22 +1914,24 @@ function renderBracketTab(){
    </div>
    <div id="bracketWrap"></div>`;
   document.getElementById("clsSel").onchange=e=>{ui.classId=e.target.value; ui.swapSel=null; ui.moveSel=null; render();};
-  document.getElementById("rebuildBr").onclick=()=>rebuildBracketOf(cls);
-  document.getElementById("clearBr").onclick=()=>clearBracketOf(cls);
-  document.getElementById("swapMode").onclick=()=>{ ui.swapMode=!ui.swapMode; if(ui.swapMode){ui.moveMode=false;ui.moveSel=null;ui.numMode=false;ui.numSel=null;} ui.swapSel=null; render(); };
-  document.getElementById("moveMode").onclick=()=>{ ui.moveMode=!ui.moveMode; if(ui.moveMode){ui.swapMode=false;ui.swapSel=null;ui.numMode=false;ui.numSel=null;} ui.moveSel=null; render(); };
-  document.getElementById("numMode").onclick=()=>{ ui.numMode=!ui.numMode; if(ui.numMode){ui.swapMode=false;ui.swapSel=null;ui.moveMode=false;ui.moveSel=null;} ui.numSel=null; render(); };
+  if(isAdmin()){
+    document.getElementById("rebuildBr").onclick=()=>rebuildBracketOf(cls);
+    document.getElementById("clearBr").onclick=()=>clearBracketOf(cls);
+    document.getElementById("swapMode").onclick=()=>{ ui.swapMode=!ui.swapMode; if(ui.swapMode){ui.moveMode=false;ui.moveSel=null;ui.numMode=false;ui.numSel=null;} ui.swapSel=null; render(); };
+    document.getElementById("moveMode").onclick=()=>{ ui.moveMode=!ui.moveMode; if(ui.moveMode){ui.swapMode=false;ui.swapSel=null;ui.numMode=false;ui.numSel=null;} ui.moveSel=null; render(); };
+    document.getElementById("numMode").onclick=()=>{ ui.numMode=!ui.numMode; if(ui.numMode){ui.swapMode=false;ui.swapSel=null;ui.moveMode=false;ui.moveSel=null;} ui.numSel=null; render(); };
+    const replBtnBr=document.getElementById("replBtnBr");
+    if(replBtnBr) replBtnBr.onclick=()=>{
+      const oldEntry=document.getElementById("replSelBr").value;
+      const nn=document.getElementById("replNewBr").value.trim();
+      if(!nn){ alert("Skriv namnet på den nya deltagaren."); return; }
+      replaceParticipant(cls, oldEntry, nn);
+    };
+  }
   document.getElementById("printBr").onclick=()=>printOneBracket(cls);
   document.getElementById("imgBr").onclick=()=>exportBracketImage(cls);
   document.getElementById("imgAllBr").onclick=()=>exportAllBracketImages();
   { const db=document.getElementById("diplomaBr"); if(db) db.onclick=()=>printChampionDiplomas(cls); }
-  const replBtnBr=document.getElementById("replBtnBr");
-  if(replBtnBr) replBtnBr.onclick=()=>{
-    const oldEntry=document.getElementById("replSelBr").value;
-    const nn=document.getElementById("replNewBr").value.trim();
-    if(!nn){ alert("Skriv namnet på den nya deltagaren."); return; }
-    replaceParticipant(cls, oldEntry, nn);
-  };
   const wrap=document.getElementById("bracketWrap");
   if(!cls.matches.length){
     if(cls.participants.length>=2){
@@ -1535,7 +1957,8 @@ function renderBracketTab(){
         <div class="who">${dispName(cls.champion)||"–"}</div></div></div>`;
   html+=`</div></div>`;
   wrap.innerHTML=html;
-  // events
+  // events (endast admin – publik läsvy har inga redigeringshändelser)
+  if(isAdmin()){
   // Flytta-match-läge: klick på hela matchrutan (första omgången) väljer/byter match.
   if(ui.moveMode){
     document.querySelectorAll('.match[data-r="0"]').forEach(el=>{
@@ -1566,6 +1989,7 @@ function renderBracketTab(){
     const ws=document.getElementById(`win_${m.id}`);
     if(ws) ws.onchange=()=>{ registerWinner(cls,m,ws.value); };
   });
+  }
   requestAnimationFrame(()=>layoutBracketEl(document.querySelector('.bracket')));
 }
 // Balanserad trädlayout: final centrerad, jämna avstånd, tydliga vinkellinjer.
@@ -1649,14 +2073,14 @@ function matchHTML(cls,m,total){
   return `<div class="match${moveCls}${numCls}${playedCls}" data-r="${m.round}" data-i="${m.index}" style="border-left:5px solid ${classColor(cls)}">
      ${slotHTML(m.p1,"p1")}
      ${slotHTML(m.p2,"p2")}
-     ${ (m.p1&&m.p2) ? `<div class="scorerow">
+     ${ (m.p1&&m.p2) ? (isAdmin() ? `<div class="scorerow">
          <input type="text" id="sc_${m.id}" value="${m.score||''}" placeholder="ex. 6-3 6-4">
          <select id="win_${m.id}" class="winsel" title="Välj vinnare">
            <option value="">Vinnare?</option>
            <option value="p1" ${m.winner===m.p1?'selected':''}>${dispName(m.p1)}</option>
            <option value="p2" ${m.winner===m.p2?'selected':''}>${dispName(m.p2)}</option>
          </select>
-       </div>`:""}
+       </div>` : (m.score?`<div class="scorerow"><span class="small" style="padding:2px 2px">${m.score}</span></div>`:"") ):""}
      ${sched}
    </div>`;
 }
@@ -1718,7 +2142,10 @@ function dayLong(date){ const d=getDays().find(x=>x.date===date); return d?`${d.
 /* ----- Tab 3: Schema ----- */
 function renderSchedule(){
   app.innerHTML=`
-   <div class="hint no-print">
+   <div class="hint no-print publiconly">
+     👁 <b>${L('Publik läsvy','Public view')}</b> – ${L('schemat visas skrivskyddat. Välj dag nedan. (Redigering kräver admin.)','the schedule is shown read-only. Pick a day below. (Editing requires admin.)')}
+   </div>
+   <div class="hint no-print adminonly">
      ${L('Auto-planering (paus efter var 3:e match, lunch 12–13):','Auto planning (break after every 3rd match, lunch 12–13):')}
      <b>${L('Junior','Junior')}</b> ${L('30 min – vardag, första start 09:00 (sista ≤ 12:30).','30 min – weekdays, first start 09:00 (last ≤ 12:30).')}
      <b>${L('Senior','Senior')}</b> ${L('60 min – vardag från 13:00, <b>helg från 09:00</b> (sista start ≤ 20:00). Lör/sön: endast seniorer.','60 min – weekdays from 13:00, <b>weekend from 09:00</b> (last start ≤ 20:00). Sat/Sun: seniors only.')}
@@ -1727,7 +2154,7 @@ function renderSchedule(){
      ${L('övriga finaler','other finals')} ${adultFinalDay()?dayLong(adultFinalDay()):L('sista dagen','the last day')}.
    </div>
    <div class="daybar no-print" id="daybar"></div>
-   <div class="toolbar no-print">
+   <div class="toolbar no-print adminonly">
      <button class="btn" id="genDay">⚙ Generera schema för dagen</button>
      <button class="btn ghost" id="clearDay">Töm dagens schema</button>
      <button class="btn ${dayLocked(ui.day)?'':'ghost'}" id="lockDay" title="Lås dagens resultat så att de inte ändras av misstag">${dayLocked(ui.day)?'🔓 Lås upp dagens resultat':'🔒 Lås dagens resultat'}</button>
@@ -1749,9 +2176,9 @@ function renderSchedule(){
      </select></label>
      <button class="btn ghost mini" id="printSched">🖨 Skriv ut dagens schema</button>
      <button class="btn ghost mini" id="imgSched">📷 ${L('Spara dagens schema som bild','Save the day\'s schedule as image')}</button>
-     <button class="btn ghost mini" id="printBlank">🖨 Skriv ut blankt schema</button>
+     <button class="btn ghost mini adminonly" id="printBlank">🖨 Skriv ut blankt schema</button>
    </div>
-   <div class="card no-print">
+   <div class="card no-print adminonly">
      <h2>Lägg till match i schemat (${dayShort(ui.day)})</h2>
      <div class="row">
        <label class="small">Klass:
@@ -1768,7 +2195,7 @@ function renderSchedule(){
        <button class="btn" id="addMatch">➕ Lägg in match</button>
      </div>
    </div>
-   <div class="card no-print">
+   <div class="card no-print adminonly">
      <h2>Sök i schemat</h2>
      <div class="row">
        <input type="text" id="schedSearch" placeholder="🔎 Klass eller deltagare…" value="${(ui.schedSearch||'').replace(/"/g,'&quot;')}" style="min-width:220px">
@@ -1778,7 +2205,7 @@ function renderSchedule(){
      </div>
      <div id="schedSearchRes"></div>
    </div>
-   <div class="hint no-print" style="border-color:#e0a3a3;background:#fdf1f1">
+   <div class="hint no-print adminonly" style="border-color:#e0a3a3;background:#fdf1f1">
      <b style="color:#b5362b">${L('🔴 Röd match (felkod) = schemakrock.','🔴 Red match (error code) = schedule conflict.')}</b> ${L('En match markeras röd när den krockar med schemat. Den exakta orsaken visas i rött inuti matchrutan. Det finns tre orsaker:','A match is marked red when it conflicts with the schedule. The exact reason is shown in red inside the match box. There are three causes:')}
      <ul style="margin:6px 0 0;padding-left:18px">
        <li><b>${L('Dubbelbokad bana','Double-booked court')}</b> – ${L('två matcher ligger på <b>samma bana och tid</b>. Flytta någon av dem till en annan bana eller tid.','two matches are on the <b>same court and time</b>. Move one of them to another court or time.')}</li>
@@ -1788,11 +2215,11 @@ function renderSchedule(){
      <span class="muted">${L('Rätta genom att ändra <b>dag</b>, <b>tid</b> eller <b>bana</b> på matchen – markeringen försvinner när krocken är löst.','Fix it by changing the <b>day</b>, <b>time</b> or <b>court</b> of the match – the marker disappears once the conflict is resolved.')}</span>
    </div>
    <div id="schedWrap"></div>
-   <div class="card no-print">
+   <div class="card no-print adminonly">
      <h2>Ej schemalagda, spelklara matcher</h2>
      <div class="unsched" id="unsched"></div>
    </div>
-   <div class="card no-print">
+   <div class="card no-print adminonly">
      <h2>${L('Framtida matcher (planera via matchnummer)','Future matches (plan by match number)')}
        <label class="small" style="font-weight:normal;margin-left:10px"><input type="checkbox" id="showFuture" ${ui.showFuture?'checked':''}> ${L('Visa','Show')}</label></h2>
      <p class="small muted">${L('Matcher vars spelare ännu inte är avgjorda (senare omgångar). Du kan förhandsplanera dem på ett datum via deras matchnummer – spelarna fylls i automatiskt när tidigare omgångar avgjorts.','Matches whose players are not yet decided (later rounds). You can pre-plan them on a date by their match number – the players fill in automatically once earlier rounds are decided.')}</p>
@@ -2031,7 +2458,7 @@ function mtileHTML(m,bad){
      </div>`:"";
   return `<div class="mtile${conf}${locked?' locked':''}${m.winner?' played':''}" data-id="${m.id}" style="border-left-color:${col}">
      <div class="cls"><span class="cdot" style="background:${col}"></span>${matchNoTag(m)}${c.name}${locked?' <span class="lockmark">🔒</span>':''}${stageTag(c,m)}</div>
-     <div class="vs">${dispName(m.p1)||'?'} <span class="muted">vs</span> ${dispName(m.p2)||'?'}${m.winner?` <span style="color:var(--green)">🏆 ${dispName(m.winner)}</span>`:''}</div>
+     <div class="vs">${slotFeedLabel(c,m,0)} <span class="muted">vs</span> ${slotFeedLabel(c,m,1)}${m.winner?` <span style="color:var(--green)">🏆 ${dispName(m.winner)}</span>`:''}</div>
      ${conflictMsg}
      ${softMsg}
      ${winsel}
@@ -2107,7 +2534,7 @@ function renderFuture(){
     const col=classColor(c);
     const tiles=ms.map(m=>`<div class="mtile" style="width:240px;border-left-color:${col}">
       <div class="cls"><span class="cdot" style="background:${col}"></span>${matchNoTag(m)}${c.name}${stageTag(c,m)}</div>
-      <div class="vs"><span class="muted">${L('spelare avgörs senare','players decided later')}</span></div>
+      <div class="vs">${slotFeedLabel(c,m,0)} <span class="muted">vs</span> ${slotFeedLabel(c,m,1)}</div>
       <div class="ctrls"><button class="btn mini" data-fplace="${m.id}">➕ ${L('Lägg in','Add')} ${dayShort(ui.day)}</button></div>
     </div>`).join("");
     return `<div class="unschedgroup">
@@ -2545,7 +2972,15 @@ function playerMatches(name, filterId){
   for(const c of classes) for(const m of c.matches){
     if((m.p1 || m.p2) && !isByeMatch(m) && playersOf(m).includes(name)) res.push({m,c});
   }
+  // Sortera per deltagare efter klass (klassindex), sedan matchordning inom klassen
+  // (matchnummer om det finns, annars omgång/plats), och sist på dag/tid.
   return res.sort((a,b)=>{
+    const cc=classCatNo(a.c)-classCatNo(b.c); if(cc) return cc;
+    const na=matchNumber(a.m), nb=matchNumber(b.m);
+    if(na!=null && nb!=null && na!==nb) return na-nb;
+    if((na==null)!==(nb==null)) return na==null?1:-1;   // numrerade matcher först
+    if(a.m.round!==b.m.round) return a.m.round-b.m.round;
+    if((a.m.index||0)!==(b.m.index||0)) return (a.m.index||0)-(b.m.index||0);
     const da=(a.m.day||"9"), db=(b.m.day||"9");
     return da<db?-1:da>db?1:((a.m.time||0)-(b.m.time||0));
   });
@@ -3318,6 +3753,7 @@ const LOGO_SVG = `
 document.getElementById("logoHolder").innerHTML=LOGO_SVG;
 
 render();
+cloudInit();   // anslut till molnet och synka (om aktiverat)
 </script>
 </body>
 </html>
