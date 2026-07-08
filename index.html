@@ -203,7 +203,11 @@
    Dalarö Tennisklubb – Klubbmästerskap. Lokal app (localStorage).
    ========================================================= */
 
-const LS_KEY = "km_dalaro";
+// Delad nyckel för denna app-instans (unik per app). Styr både molnraden (Supabase)
+// och de lokala lagringsnycklarna, så två appar på samma domän aldrig delar data.
+const TOURN_KEY = "TennisAppen";   // delad nyckel – alla enheter som använder denna delar samma data
+const LS_KEY    = "km_" + TOURN_KEY;         // lokal cache – unik per app (tidigare fast "km_dalaro")
+const ADMIN_KEY = "km_admin_" + TOURN_KEY;   // admin-flagga – unik per app
 
 // --- Turneringsdagar beräknas från turneringens start- och slutdatum ---
 const SV_DOW = ["Söndag","Måndag","Tisdag","Onsdag","Torsdag","Fredag","Lördag"];
@@ -501,8 +505,8 @@ function save(){ if(!isAdmin()) return; state.updatedAt = Date.now(); saveLocal(
    Admin låses upp med en PIN och kommer ihåg per enhet (localStorage).   */
 const ADMIN_PIN = "2323";   // Standard-PIN (används tills en egen PIN satts under Turneringsinformation).
 function adminPin(){ return (state && typeof state.adminPin==="string" && state.adminPin.trim()) ? state.adminPin.trim() : ADMIN_PIN; }
-function isAdmin(){ try{ return localStorage.getItem("km_admin")==="1"; }catch(e){ return false; } }
-function setAdminFlag(on){ try{ if(on) localStorage.setItem("km_admin","1"); else localStorage.removeItem("km_admin"); }catch(e){} }
+function isAdmin(){ try{ return localStorage.getItem(ADMIN_KEY)==="1"; }catch(e){ return false; } }
+function setAdminFlag(on){ try{ if(on) localStorage.setItem(ADMIN_KEY,"1"); else localStorage.removeItem(ADMIN_KEY); }catch(e){} }
 function promptAdmin(){
   const pin=prompt(L("Ange admin-PIN för att låsa upp redigering:","Enter admin PIN to unlock editing:"));
   if(pin==null) return;
@@ -526,7 +530,7 @@ function updateAdminBtn(){
    med Supabase. localStorage används fortfarande som offline-backup.   */
 const SUPA_URL  = "https://eynebozqtgnrbyouigpm.supabase.co/rest/v1";
 const SUPA_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV5bmVib3pxdGducmJ5b3VpZ3BtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODM0NzE4MDgsImV4cCI6MjA5OTA0NzgwOH0.LYb7OBsrQpBFPxL6axUPiF4yZdD1M9VADXPVYLlRi1E";
-const TOURN_KEY = "TennisAppen";   // delad nyckel – alla enheter som använder denna delar samma data
+// TOURN_KEY definieras högst upp (styr även LS_KEY/ADMIN_KEY så apparna inte delar lokal cache).
 const cloudEnabled = /^https?:\/\//.test(SUPA_URL) && SUPA_KEY.length>20;
 let cloudStatus = "off";         // off | connecting | ok | saving | offline
 let cloudLastSync = 0;
