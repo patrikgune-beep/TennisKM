@@ -208,8 +208,24 @@
 // TOURN_KEY är numera VALBAR: varje turnering är en egen rad i molnet med sin egen nyckel.
 // Aktiv turnering minns per enhet i localStorage ("km_current_tourn").
 const DEFAULT_TOURN_KEY = "TennisAppen";     // grundturnering om inget annat valts
-function currentTournKey(){ try{ return localStorage.getItem("km_current_tourn") || DEFAULT_TOURN_KEY; }catch(e){ return DEFAULT_TOURN_KEY; } }
-let TOURN_KEY   = currentTournKey();         // aktiv turnering (byts i Turneringsinformation)
+// Läs turneringsnyckel ur adressen: ?t=nyckel (stöder även #t=nyckel för delade hash-länkar).
+function tournKeyFromURL(){
+  try{
+    const u=new URL(location.href);
+    const q=u.searchParams.get("t"); if(q) return q;
+    const m=(u.hash||"").match(/[#&]t=([^&]+)/); if(m) return decodeURIComponent(m[1]);
+  }catch(e){}
+  return null;
+}
+function currentTournKey(){
+  const fromUrl=tournKeyFromURL();
+  if(fromUrl){ try{ localStorage.setItem("km_current_tourn", fromUrl); }catch(e){} return fromUrl; }
+  try{ return localStorage.getItem("km_current_tourn") || DEFAULT_TOURN_KEY; }catch(e){ return DEFAULT_TOURN_KEY; }
+}
+let TOURN_KEY   = currentTournKey();         // aktiv turnering (byts i Turneringsinformation / via ?t=)
+// Delbar länk till aktiv turnering, och synka adressfältet så den alltid speglar vald turnering.
+function tournShareURL(){ try{ const u=new URL(location.href); u.searchParams.set("t", TOURN_KEY); return u.href; }catch(e){ return location.href; } }
+function updateTournURL(){ try{ const u=new URL(location.href); u.searchParams.set("t", TOURN_KEY); history.replaceState(null, "", u.pathname+u.search+u.hash); }catch(e){} }
 function lsKey(){ return "km_" + TOURN_KEY; } // lokal cache – per aktiv turnering
 const ADMIN_KEY = "km_admin_" + DEFAULT_TOURN_KEY;   // admin-flagga – per app (gäller alla turneringar)
 
@@ -694,7 +710,7 @@ async function createTournament(name){
   if(!name){ alert("Ange ett namn på turneringen."); return; }
   if(isAdmin()) await cloudForcePush();                       // spara pågående turnering först
   const key=(fileSafe(name).toLowerCase()||"turnering")+"-"+Date.now().toString(36);   // unik nyckel
-  localStorage.setItem("km_current_tourn", key); TOURN_KEY=key;   // byt aktiv turnering
+  localStorage.setItem("km_current_tourn", key); TOURN_KEY=key; updateTournURL();   // byt aktiv turnering
   state=newState(); state.tournament.name=name; state.updatedAt=Date.now();
   saveLocal();
   ui={ tab:"info", classId:state.classes[0].id, day:null }; ensureDay();
@@ -705,7 +721,7 @@ async function createTournament(name){
 async function switchTournament(key){
   if(!key || key===TOURN_KEY) return;
   if(isAdmin()) await cloudForcePush();                       // spara pågående turnering först
-  localStorage.setItem("km_current_tourn", key); TOURN_KEY=key;
+  localStorage.setItem("km_current_tourn", key); TOURN_KEY=key; updateTournURL();
   cloudSetStatus("connecting");
   try{
     const data=await cloudGet();
@@ -1452,6 +1468,7 @@ function renderInfo(){
        <label class="small" style="flex:1;min-width:220px">Aktiv turnering<br>
          <select id="tournSwitch" style="width:100%;max-width:360px" ${cloudEnabled?'':'disabled'}><option>${esc(t.name)||TOURN_KEY}</option></select></label>
        <button class="btn mini" id="tournNewBtn">➕ Ny turnering</button>
+       <button class="btn ghost mini" id="tournCopyBtn">🔗 Kopiera länk</button>
        <button class="btn ghost mini" id="tournDelBtn" ${cloudEnabled?'':'disabled'}>🗑 Ta bort denna</button>
      </div>
      <div class="small muted" id="tournMsg" style="margin-top:6px">${cloudEnabled?'':'Molnsynk är inte aktiverad – flera turneringar kräver molnet.'}</div>
@@ -1670,6 +1687,11 @@ function renderInfo(){
   { const b=document.getElementById("tournDelBtn"); if(b) b.onclick=()=>deleteTournament(TOURN_KEY); }
   { const b=document.getElementById("tournArchiveBtn");   if(b) b.onclick=archiveTournament; }
   { const b=document.getElementById("tournUnarchiveBtn"); if(b) b.onclick=unarchiveTournament; }
+  { const b=document.getElementById("tournCopyBtn"); if(b) b.onclick=async ()=>{
+      const url=tournShareURL(); const msg=document.getElementById("tournMsg");
+      try{ await navigator.clipboard.writeText(url); if(msg) msg.textContent="Länk kopierad: "+url; }
+      catch(e){ prompt("Kopiera länken till turneringen:", url); }
+    }; }
   { const sel=document.getElementById("tournSwitch");
     if(sel && cloudEnabled){
       sel.onchange=()=>{ if(sel.value!==TOURN_KEY) switchTournament(sel.value); };
@@ -3944,6 +3966,7 @@ const LOGO_SVG = `
 </svg>`;
 document.getElementById("logoHolder").innerHTML=LOGO_SVG;
 
+updateTournURL();   // se till att adressen speglar aktiv turnering (?t=nyckel) redan vid start
 render();
 cloudInit();   // anslut till molnet och synka (om aktiverat)
 </script>
