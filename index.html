@@ -505,8 +505,11 @@ function ensureDay(){
 }
 function load(){ try{ const r=localStorage.getItem(lsKey()); return r?JSON.parse(r):null; }catch(e){ return null; } }
 function saveLocal(){ try{ localStorage.setItem(lsKey(), JSON.stringify(state)); }catch(e){} }
-// Publik läsvy kan ALDRIG skriva (varken lokalt eller till molnet) – bara admin sparar.
-function save(){ if(!isAdmin()) return; state.updatedAt = Date.now(); saveLocal(); cloudSchedulePush(); }
+// Intern spara som ALLTID skriver för admin (används av arkivering/upplåsning, som måste
+// kunna spara även när turneringen är i arkiverat/skrivskyddat läge).
+function persistState(){ if(!isAdmin()) return; state.updatedAt = Date.now(); saveLocal(); cloudSchedulePush(); }
+// Vanlig spara: publik läsvy skriver ALDRIG, och en ARKIVERAD turnering är helt skrivskyddad.
+function save(){ if(!isAdmin() || isArchived()) return; persistState(); }
 
 /* ---------- Arkivering ----------
    En arkiverad (slutspelad) turnering visar publikt endast Turneringsinformation,
@@ -518,9 +521,9 @@ function archiveTournament(){
   const pin=prompt(L("Ange admin-PIN för att arkivera turneringen:","Enter admin PIN to archive the tournament:"));
   if(pin==null) return;
   if(pin!==adminPin()){ alert(L("Fel PIN – turneringen arkiverades inte.","Wrong PIN – the tournament was not archived.")); return; }
-  if(!confirm(L("Arkivera turneringen? Publikt visas då endast Turneringsinformation, Stegar och Klubbmästare. Du kan låsa upp den igen när som helst.","Archive the tournament? Publicly only Tournament info, Brackets and Club champions will be shown. You can unlock it again at any time."))) return;
+  if(!confirm(L("Arkivera turneringen? Den blir skrivskyddad och publikt visas endast Turneringsinformation, Stegar och Klubbmästare. Du kan låsa upp den igen när som helst.","Archive the tournament? It becomes read-only and publicly only Tournament info, Brackets and Club champions are shown. You can unlock it again at any time."))) return;
   state.archived=true; state.archivedAt=Date.now();
-  save(); render();
+  persistState(); render();
 }
 function unarchiveTournament(){
   if(!isAdmin()) return;
@@ -528,7 +531,7 @@ function unarchiveTournament(){
   if(pin==null) return;
   if(pin!==adminPin()){ alert(L("Fel PIN – turneringen låstes inte upp.","Wrong PIN – the tournament was not unlocked.")); return; }
   state.archived=false; state.archivedAt=0;
-  save(); render();
+  persistState(); render();
 }
 
 /* ===================== Admin / publik läsvy =====================
@@ -1191,6 +1194,16 @@ function render(){
   else if(ui.tab==="stats") renderStats();
   else if(ui.tab==="champions") renderChampions();
   else if(ui.tab==="about") renderAbout();
+  // Skrivskydds-banner för admin på en arkiverad turnering (visas överst på alla flikar).
+  if(isAdmin() && isArchived()){
+    app.insertAdjacentHTML("afterbegin", `<div class="card no-print" style="border-color:var(--gold);background:#fbf4df">
+       <div class="row" style="align-items:center;gap:10px">
+         <b style="color:#8a6d1b">📦 ${L('Arkiverad – skrivskyddad','Archived – read-only')}</b>
+         <span class="small muted">${L('Ändringar sparas inte. Lås upp turneringen för att redigera.','Changes are not saved. Unlock the tournament to edit.')}</span>
+         <button class="btn ghost mini" id="bannerUnlock">🔓 ${L('Lås upp','Unlock')}</button>
+       </div></div>`);
+    const bu=document.getElementById("bannerUnlock"); if(bu) bu.onclick=unarchiveTournament;
+  }
   applyLang();   // översätt gränssnittet till engelska om valt
 }
 // Flikar i publik läsvy: normalt Info+Stege+Schema+Sök; arkiverad turnering: Info+Stege+Klubbmästare.
@@ -1999,6 +2012,7 @@ function renderClasses(){
 }
 // Rensar HELA appen: deltagare, stegar, scheman, datum. Används av båda nollställ-knapparna.
 async function resetEverything(){
+  if(isArchived()){ alert("Turneringen är arkiverad (skrivskyddad). Lås upp den först för att nollställa."); return; }
   if(!confirm("Ny turnering – nollställ ALLT (deltagare, stegar och scheman i alla klasser)? Detta kan inte ångras.")) return;
   // Robust nollställning: rensa lagringen och ladda om sidan -> helt färskt tillstånd.
   try{ localStorage.removeItem(lsKey()); }catch(e){}
