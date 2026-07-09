@@ -1959,13 +1959,15 @@ function renderClasses(){
   // grid
   document.getElementById("clsGrid").innerHTML=[...state.classes].sort((a,b)=>(a.catNo||0)-(b.catNo||0)).map(c=>{
     const done=c.champion?`<span class="badge done">✓ ${dispName(c.champion)}</span>`:"";
-    return `<div class="classcard ${c.id===cls.id?'active':''}" data-id="${c.id}" style="${c.hidden?'opacity:.45':''}">
+    const hasBracket=!!(c.matches && c.matches.length);   // klass med byggd stege
+    const cardStyle=`${c.hidden?'opacity:.45;':''}${hasBracket?'border:3px solid var(--head);':''}`;
+    return `<div class="classcard ${c.id===cls.id?'active':''}" data-id="${c.id}" style="${cardStyle}">
       <div class="ttl"><span class="sw" style="background:${classColor(c)}"></span><span class="mno" style="margin-right:5px">#${c.catNo}</span>${c.name} ${isRanked(c)?`<span title="Seedas – top ${seedCountOf(c)}" style="color:#c9a227">★</span>`:''} ${c.hidden?'🙈':''}</div>
       <div class="meta">
         <span class="badge ${c.type}">${c.type==='youth'?'Ungdom':'Senior'}</span>
         ${c.category?`<span class="badge" style="background:#eef;color:#3a3a7a">${classCategoryLabel(c.category)}</span>`:''}
         ${c.ageLevel?`<span class="badge" style="background:#efe;color:#3a7a3a">${c.ageLevel}</span>`:''}
-        &nbsp;${c.participants.length} delt. ${done}
+        &nbsp;${c.participants.length} delt.${hasBracket?' (Stege)':''} ${done}
       </div></div>`;
   }).join("");
   document.querySelectorAll("#clsGrid .classcard").forEach(el=>
