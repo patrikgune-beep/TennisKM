@@ -365,6 +365,8 @@ function newState(){
     extraCourts: {},
     lockedDays: {},
     planCourts: {},
+    archived: false,
+    archivedAt: 0,
     tournament: defaultTournament(),
     arranger: "Dalarö Tennisklubb",
     organizer: { name:"", phone:"", email:"" },
@@ -399,6 +401,8 @@ function normalize(s){
   if(typeof s.venue!=="string") s.venue="";
   if(typeof s.adminPin!=="string") s.adminPin="";
   if(typeof s.updatedAt!=="number") s.updatedAt=0;
+  if(typeof s.archived!=="boolean") s.archived=false;
+  if(typeof s.archivedAt!=="number") s.archivedAt=0;
   if(!s.extraCourts) s.extraCourts={};
   if(!s.lockedDays) s.lockedDays={};
   if(!s.planFinalDays) s.planFinalDays={};
@@ -503,6 +507,29 @@ function load(){ try{ const r=localStorage.getItem(lsKey()); return r?JSON.parse
 function saveLocal(){ try{ localStorage.setItem(lsKey(), JSON.stringify(state)); }catch(e){} }
 // Publik läsvy kan ALDRIG skriva (varken lokalt eller till molnet) – bara admin sparar.
 function save(){ if(!isAdmin()) return; state.updatedAt = Date.now(); saveLocal(); cloudSchedulePush(); }
+
+/* ---------- Arkivering ----------
+   En arkiverad (slutspelad) turnering visar publikt endast Turneringsinformation,
+   Stege och Klubbmästare. Alla matcher/finaler behöver inte vara avgjorda.
+   Arkivering och upplåsning kräver admin-PIN.   */
+function isArchived(){ return !!(state && state.archived); }
+function archiveTournament(){
+  if(!isAdmin()) return;
+  const pin=prompt(L("Ange admin-PIN för att arkivera turneringen:","Enter admin PIN to archive the tournament:"));
+  if(pin==null) return;
+  if(pin!==adminPin()){ alert(L("Fel PIN – turneringen arkiverades inte.","Wrong PIN – the tournament was not archived.")); return; }
+  if(!confirm(L("Arkivera turneringen? Publikt visas då endast Turneringsinformation, Stegar och Klubbmästare. Du kan låsa upp den igen när som helst.","Archive the tournament? Publicly only Tournament info, Brackets and Club champions will be shown. You can unlock it again at any time."))) return;
+  state.archived=true; state.archivedAt=Date.now();
+  save(); render();
+}
+function unarchiveTournament(){
+  if(!isAdmin()) return;
+  const pin=prompt(L("Ange admin-PIN för att låsa upp den arkiverade turneringen:","Enter admin PIN to unlock the archived tournament:"));
+  if(pin==null) return;
+  if(pin!==adminPin()){ alert(L("Fel PIN – turneringen låstes inte upp.","Wrong PIN – the tournament was not unlocked.")); return; }
+  state.archived=false; state.archivedAt=0;
+  save(); render();
+}
 
 /* ===================== Admin / publik läsvy =====================
    Publik vy (standard) = endast Stege + Schema, ingen redigering.
@@ -1011,7 +1038,7 @@ const EN = {
   "Turneringsinformation":"Tournament info", "Klasser & deltagare":"Classes & players",
   "Stege":"Bracket", "Schema":"Schedule", "Auto-planering":"Auto planning",
   "Deltagarlista":"Player list", "Resultat & utskrift":"Results & printing",
-  "Statistik":"Statistics", "Om appen":"About", "Önskemål":"Requests",
+  "Statistik":"Statistics", "Om appen":"About", "Önskemål":"Requests", "Klubbmästare":"Club champions",
   // Turneringsinformation
   "Turnering":"Tournament", "Turneringens namn":"Tournament name", "Arrangör":"Organiser",
   "Startdatum":"Start date", "Slutdatum":"End date", "Antal banor (grundantal)":"Number of courts (base)",
@@ -1142,8 +1169,12 @@ function render(){
   applyTheme();
   updateAdminBtn();
   document.body.classList.toggle("public", !isAdmin());
-  // Publik läsvy får bara vara på Turneringsinformation, Stege, Schema eller Sök deltagare.
-  if(!isAdmin() && !["info","bracket","schedule","psearch"].includes(ui.tab)) ui.tab="bracket";
+  document.body.classList.toggle("archived", isArchived());
+  // Publik läsvy får bara besöka tillåtna flikar (beror på om turneringen är arkiverad).
+  if(!isAdmin()){
+    const allowed=publicTabDefs().map(t=>t[0]);
+    if(!allowed.includes(ui.tab)) ui.tab="bracket";
+  }
   document.title = `${state.tournament.name||"Klubbmästerskap"} – ${arrangerName()}`;
   document.getElementById("appTitle").textContent = state.tournament.name || "Klubbmästerskap";
   document.getElementById("appSub").textContent = `${arrangerName()} · ${tournamentRangeText()}`;
@@ -1158,17 +1189,45 @@ function render(){
   else if(ui.tab==="participants") renderParticipants();
   else if(ui.tab==="print") renderPrintTab();
   else if(ui.tab==="stats") renderStats();
+  else if(ui.tab==="champions") renderChampions();
   else if(ui.tab==="about") renderAbout();
   applyLang();   // översätt gränssnittet till engelska om valt
 }
+// Flikar i publik läsvy: normalt Info+Stege+Schema+Sök; arkiverad turnering: Info+Stege+Klubbmästare.
+function publicTabDefs(){
+  return isArchived()
+    ? [["info","Turneringsinformation"],["bracket","Stege"],["champions","Klubbmästare"]]
+    : [["info","Turneringsinformation"],["bracket","Stege"],["schedule","Schema"],["psearch","Sök deltagare"]];
+}
 function renderTabs(){
-  const all=[["info","Turneringsinformation"],["classes","Klasser & deltagare"],["bracket","Stege"],["schedule","Schema"],["requests","Önskemål"],["planner","Auto-planering"],["participants","Deltagarlista"],["print","Resultat & utskrift"],["stats","Statistik"],["about","Om appen"]];
-  // Publik läsvy: Turneringsinformation + Stege + Schema + Sök deltagare (skrivskyddat).
-  const publicTabs=[["info","Turneringsinformation"],["bracket","Stege"],["schedule","Schema"],["psearch","Sök deltagare"]];
-  const tabs = isAdmin() ? all : publicTabs;
+  const all=[["info","Turneringsinformation"],["classes","Klasser & deltagare"],["bracket","Stege"],["schedule","Schema"],["requests","Önskemål"],["planner","Auto-planering"],["participants","Deltagarlista"],["print","Resultat & utskrift"],["stats","Statistik"],["champions","Klubbmästare"],["about","Om appen"]];
+  const tabs = isAdmin() ? all : publicTabDefs();
   document.getElementById("tabs").innerHTML=tabs.map(([k,l])=>
     `<button class="${ui.tab===k?'active':''}" data-tab="${k}">${l}</button>`).join("");
   document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{ui.tab=b.dataset.tab;render();});
+}
+
+/* ----- Flik: Klubbmästare ----- */
+function renderChampions(){
+  const cls=visibleClasses();
+  const cards=cls.map(c=>{
+    const has=!!c.champion;
+    return `<div class="classcard" style="cursor:default;border-top:4px solid ${classColor(c)}">
+       <div class="ttl">${c.name}</div>
+       <div style="font-size:16px;font-weight:800;margin-top:8px;color:${has?'var(--green)':'#b3aa98'}">
+         ${has?'🏆 '+dispName(c.champion):L('– ej avgjord –','– not decided –')}</div>
+     </div>`;
+  }).join("");
+  const decided=cls.filter(c=>c.champion).length;
+  app.innerHTML=`
+   <div class="card">
+     ${isArchived()?`<div class="pill" style="background:#e3f1de;color:var(--green);margin-bottom:10px">📦 ${L('Arkiverad turnering','Archived tournament')}</div>`:''}
+     <h2>🏆 ${L('Klubbmästare','Club champions')} ${tournamentYear()}</h2>
+     <p class="small muted">${arrangerName()} · ${state.tournament.name||"Klubbmästerskap"} · ${tournamentRangeText()} · ${decided}/${cls.length} ${L('avgjorda','decided')}</p>
+     <div class="grid-classes" style="margin-top:12px">${cards||`<span class="empty">${L('Inga klasser.','No classes.')}</span>`}</div>
+     ${isAdmin()?`<div class="row adminonly" style="margin-top:14px"><button class="btn ghost mini" id="champPrint">🏆 ${L('Skriv ut alla klubbmästare','Print all club champions')}</button></div>`:''}
+   </div>`;
+  { const b=document.getElementById("champPrint"); if(b) b.onclick=printChampions; }
 }
 
 /* ----- Versionsstämpel (utifrån när denna index.html senast sparades) ----- */
@@ -1383,6 +1442,15 @@ function renderInfo(){
        <button class="btn ghost mini" id="tournDelBtn" ${cloudEnabled?'':'disabled'}>🗑 Ta bort denna</button>
      </div>
      <div class="small muted" id="tournMsg" style="margin-top:6px">${cloudEnabled?'':'Molnsynk är inte aktiverad – flera turneringar kräver molnet.'}</div>
+     <hr style="border:none;border-top:1px solid var(--line);margin:12px 0">
+     <div class="row" style="align-items:center;gap:10px">
+       ${isArchived()
+         ? `<span class="pill" style="background:#e3f1de;color:var(--green)">📦 Arkiverad${state.archivedAt?` – ${new Date(state.archivedAt).toLocaleDateString("sv-SE")}`:""}</span>
+            <button class="btn ghost mini" id="tournUnarchiveBtn">🔓 Lås upp turnering</button>
+            <span class="small muted">Publikt visas nu endast Turneringsinformation, Stegar och Klubbmästare.</span>`
+         : `<button class="btn mini" id="tournArchiveBtn">📦 Arkivera turnering</button>
+            <span class="small muted">Kräver admin-PIN. Alla matcher/finaler behöver inte vara avgjorda. Publikt visas då endast Turneringsinformation, Stegar och Klubbmästare.</span>`}
+     </div>
    </div>
    <div class="card no-print">
      <h2>Turneringsnamn</h2>
@@ -1587,6 +1655,8 @@ function renderInfo(){
   // --- Turneringar: skapa / byt / ta bort ---
   { const b=document.getElementById("tournNewBtn"); if(b) b.onclick=()=>{ const nm=prompt("Namn på den nya turneringen:"); if(nm!=null) createTournament(nm); }; }
   { const b=document.getElementById("tournDelBtn"); if(b) b.onclick=()=>deleteTournament(TOURN_KEY); }
+  { const b=document.getElementById("tournArchiveBtn");   if(b) b.onclick=archiveTournament; }
+  { const b=document.getElementById("tournUnarchiveBtn"); if(b) b.onclick=unarchiveTournament; }
   { const sel=document.getElementById("tournSwitch");
     if(sel && cloudEnabled){
       sel.onchange=()=>{ if(sel.value!==TOURN_KEY) switchTournament(sel.value); };
