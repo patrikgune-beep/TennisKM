@@ -186,6 +186,7 @@
     <p class="sub" id="appSub">Dalarö Tennisklubb</p>
   </div>
   <div class="spacer"></div>
+  <button id="linkBtn" class="btn ghost mini no-print publiconly" style="white-space:nowrap"></button>
   <button id="adminBtn" class="btn ghost mini no-print" style="white-space:nowrap"></button>
   <div class="sync-badge no-print js-sync" id="syncBadge" style="font-size:12px;opacity:.95;white-space:nowrap"></div>
   <div class="tabs" id="tabs"></div>
@@ -572,6 +573,19 @@ function updateAdminBtn(){
   const b=document.getElementById("adminBtn"); if(!b) return;
   if(isAdmin()){ b.textContent="🔓 "+L("Publik vy","Public view"); b.title=L("Lås till publik läsvy (dölj redigering)","Lock to public read-only view"); b.onclick=lockAdmin; }
   else { b.textContent="🔒 Admin"; b.title=L("Lås upp redigering (kräver PIN)","Unlock editing (requires PIN)"); b.onclick=promptAdmin; }
+  // Publik länk-knapp (visas endast i publik vy via .publiconly).
+  const lb=document.getElementById("linkBtn");
+  if(lb){
+    lb.textContent="🔗 "+L("Kopiera länk","Copy link");
+    lb.title=L("Kopiera länk till denna turnerings publika sida","Copy link to this tournament's public page");
+    lb.onclick=async ()=>{ const ok=await copyTournLinkTo(); if(ok){ const o=lb.textContent; lb.textContent="✓ "+L("Kopierad","Copied"); setTimeout(()=>{ lb.textContent=o; }, 1500); } };
+  }
+}
+// Kopiera aktiv turnerings delningslänk till urklipp (faller tillbaka på prompt om urklipp nekas).
+async function copyTournLinkTo(){
+  const url=tournShareURL();
+  try{ await navigator.clipboard.writeText(url); return true; }
+  catch(e){ prompt(L("Kopiera länken till turneringen:","Copy the tournament link:"), url); return false; }
 }
 
 /* ===================== Molnsynk (Supabase) =====================
@@ -712,6 +726,32 @@ async function createTournament(name){
   const key=(fileSafe(name).toLowerCase()||"turnering")+"-"+Date.now().toString(36);   // unik nyckel
   localStorage.setItem("km_current_tourn", key); TOURN_KEY=key; updateTournURL();   // byt aktiv turnering
   state=newState(); state.tournament.name=name; state.updatedAt=Date.now();
+  saveLocal();
+  ui={ tab:"info", classId:state.classes[0].id, day:null }; ensureDay();
+  if(cloudEnabled){ try{ cloudSetStatus("saving"); await cloudPut(state); cloudLastSync=Date.now(); cloudSetStatus("ok"); }catch(e){ cloudSetStatus("offline"); } }
+  render();
+}
+// Bygg ett kopie-tillstånd: behåll klasser, deltagare och inställningar men NOLLSTÄLL resultat
+// (stegar, vinnare, schemaplaceringar, mästare, låsta dagar och arkivstatus).
+function makeCopyState(src, newName){
+  const s=JSON.parse(JSON.stringify(src));                    // djupkopia
+  s.tournament=s.tournament||defaultTournament();
+  s.tournament.name=newName;
+  s.archived=false; s.archivedAt=0;
+  s.lockedDays={}; s.planFinalDays={}; s.planCourts={};
+  (s.classes||[]).forEach(c=>{ c.matches=[]; c.champion=null; });   // töm stegar + mästare (behåll deltagare)
+  return normalize(s);
+}
+// Skapa en ny turnering som kopia av den AKTIVA turneringen (byt först till den du vill kopiera).
+async function createTournamentCopy(newName){
+  if(!isAdmin()) return;
+  newName=(newName||"").trim();
+  if(!newName){ alert("Ange ett namn på den nya turneringen."); return; }
+  await cloudForcePush();                                     // spara källturneringen först
+  const copy=makeCopyState(state, newName);
+  const key=(fileSafe(newName).toLowerCase()||"turnering")+"-"+Date.now().toString(36);
+  localStorage.setItem("km_current_tourn", key); TOURN_KEY=key; updateTournURL();
+  state=copy; state.updatedAt=Date.now();
   saveLocal();
   ui={ tab:"info", classId:state.classes[0].id, day:null }; ensureDay();
   if(cloudEnabled){ try{ cloudSetStatus("saving"); await cloudPut(state); cloudLastSync=Date.now(); cloudSetStatus("ok"); }catch(e){ cloudSetStatus("offline"); } }
@@ -1468,6 +1508,7 @@ function renderInfo(){
        <label class="small" style="flex:1;min-width:220px">Aktiv turnering<br>
          <select id="tournSwitch" style="width:100%;max-width:360px" ${cloudEnabled?'':'disabled'}><option>${esc(t.name)||TOURN_KEY}</option></select></label>
        <button class="btn mini" id="tournNewBtn">➕ Ny turnering</button>
+       <button class="btn mini" id="tournCopyNewBtn">📋 Kopiera turnering</button>
        <button class="btn ghost mini" id="tournCopyBtn">🔗 Kopiera länk</button>
        <button class="btn ghost mini" id="tournDelBtn" ${cloudEnabled?'':'disabled'}>🗑 Ta bort denna</button>
      </div>
@@ -1684,13 +1725,13 @@ function renderInfo(){
   };
   // --- Turneringar: skapa / byt / ta bort ---
   { const b=document.getElementById("tournNewBtn"); if(b) b.onclick=()=>{ const nm=prompt("Namn på den nya turneringen:"); if(nm!=null) createTournament(nm); }; }
+  { const b=document.getElementById("tournCopyNewBtn"); if(b) b.onclick=()=>{ const nm=prompt(`Namn på den nya turneringen (kopia av "${state.tournament.name||TOURN_KEY}" – klasser och deltagare följer med, resultat nollställs):`); if(nm!=null) createTournamentCopy(nm); }; }
   { const b=document.getElementById("tournDelBtn"); if(b) b.onclick=()=>deleteTournament(TOURN_KEY); }
   { const b=document.getElementById("tournArchiveBtn");   if(b) b.onclick=archiveTournament; }
   { const b=document.getElementById("tournUnarchiveBtn"); if(b) b.onclick=unarchiveTournament; }
   { const b=document.getElementById("tournCopyBtn"); if(b) b.onclick=async ()=>{
-      const url=tournShareURL(); const msg=document.getElementById("tournMsg");
-      try{ await navigator.clipboard.writeText(url); if(msg) msg.textContent="Länk kopierad: "+url; }
-      catch(e){ prompt("Kopiera länken till turneringen:", url); }
+      const ok=await copyTournLinkTo(); const msg=document.getElementById("tournMsg");
+      if(ok && msg) msg.textContent="Länk kopierad: "+tournShareURL();
     }; }
   { const sel=document.getElementById("tournSwitch");
     if(sel && cloudEnabled){
