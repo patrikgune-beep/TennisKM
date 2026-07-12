@@ -736,13 +736,13 @@ async function cloudForcePull(){
 // Hämta alla turneringar ur molnet: [{key, name}] (diag-/systemrader döljs).
 async function cloudListTournaments(){
   if(!cloudEnabled) return [];
-  const url=`${SUPA_URL}/tournaments?select=key,name:data->tournament->>name,archived:data->>archived`;
+  const url=`${SUPA_URL}/tournaments?select=key,name:data->tournament->>name,arranger:data->>arranger,archived:data->>archived`;
   const r=await fetch(url, { headers: cloudHeaders() });
   if(!r.ok){ const b=await r.text().catch(()=>""); cloudLastError=`LISTA HTTP ${r.status} – ${b.slice(0,180)}`; throw new Error(cloudLastError); }
   const rows=await r.json();
   return (Array.isArray(rows)?rows:[])
     .filter(x=>x.key && !x.key.startsWith("__"))
-    .map(x=>({ key:x.key, name:x.name, archived: x.archived===true || x.archived==="true" }));
+    .map(x=>({ key:x.key, name:x.name, arranger:x.arranger||"", archived: x.archived===true || x.archived==="true" }));
 }
 // Skapa en ny, tom turnering och gör den aktiv.
 async function createTournament(name){
@@ -820,8 +820,10 @@ async function openTournament(key){
   ui={ view:"tournament", tab:"info", classId:(state.classes[0]&&state.classes[0].id)||null, day:null };
   ensureDay(); render();
 }
-// Tillbaka till startsidan (rensar ?t= ur adressen).
+// Tillbaka till startsidan (rensar ?t= ur adressen). Startsidan är ALLTID publik
+// tills PIN anges – därför låses admin här.
 function goHome(){
+  setAdminFlag(false);
   ui.view="start";
   try{ const u=new URL(location.href); u.searchParams.delete("t"); history.replaceState(null,"",u.pathname+u.search+u.hash); }catch(e){}
   render();
@@ -1399,13 +1401,14 @@ function startRenderList(list){
   }
   el.innerHTML=`<table class="results" style="width:100%"><tbody>${shown.map(t=>{
     const nm=t.name||t.key;
+    const arr=(t.arranger||"").trim();
     const badge=t.archived?` <span class="badge" style="background:#e3f1de;color:var(--green)">📦 ${L('Arkiverad','Archived')}</span>`:'';
     const esc=String(t.key).replace(/"/g,'&quot;');
     const del = admin ? (t.archived
         ? `<span class="small muted">${L('öppna & lås upp för att radera','open & unlock to delete')}</span>`
         : `<button class="btn ghost mini" data-del="${esc}">🗑 ${L('Radera','Delete')}</button>`) : '';
     return `<tr>
-       <td><b>${nm}</b>${badge}</td>
+       <td><b>${nm}</b>${badge}${arr?`<br><span class="small muted">${arr}</span>`:''}</td>
        <td style="text-align:right;white-space:nowrap">
          <button class="btn mini" data-open="${esc}">${L('Öppna','Open')} →</button> ${del}
        </td></tr>`;
@@ -1441,13 +1444,21 @@ function startRenderNewForm(list){
   document.getElementById("newCreateBtn").onclick=async ()=>{
     const name=(document.getElementById("newTName").value||"").trim();
     if(!name){ alert(L("Ange ett namn på turneringen.","Enter a tournament name.")); return; }
-    const from=sel.value; ui.startNewOpen=false;
-    if(!from){ await createTournament(name); return; }
+    const from=sel.value;
+    if(!from){ ui.startNewOpen=false; await createTournament(name); return; }
     const info=document.getElementById("copyInfo").checked, classes=document.getElementById("copyClasses").checked;
     let src=null;
     try{ src=await cloudGetKey(from); }catch(e){ alert(L("Kunde inte läsa källturneringen: ","Could not read the source tournament: ")+(e.message||e)); return; }
     if(!src){ alert(L("Källturneringen hittades inte.","Source tournament not found.")); return; }
-    await createTournamentCopy(name, {info, classes}, normalize(src));
+    src=normalize(src);
+    // Kopiering av en befintlig/arkiverad turnering kräver DEN turneringens PIN-kod.
+    const srcName=(src.tournament&&src.tournament.name)||from;
+    const srcPin=(typeof src.adminPin==="string" && src.adminPin.trim()) ? src.adminPin.trim() : ADMIN_PIN;
+    const pin=prompt(L(`Ange PIN-koden för "${srcName}" för att skapa en kopia av den turneringen:`,`Enter the PIN for "${srcName}" to create a copy of that tournament:`));
+    if(pin==null) return;
+    if(pin!==srcPin){ alert(L("Fel PIN – kopiering avbruten.","Wrong PIN – copy cancelled.")); return; }
+    ui.startNewOpen=false;
+    await createTournamentCopy(name, {info, classes}, src);
   };
 }
 
@@ -4235,7 +4246,8 @@ const LOGO_SVG = `
 </svg>`;
 document.getElementById("logoHolder").innerHTML=LOGO_SVG;
 
-if(ui.view!=="start") updateTournURL();   // spegla aktiv turnering i adressen (?t=) om man öppnat en direkt
+if(ui.view==="start") setAdminFlag(false);   // startsidan möter man alltid i publik vy (kräver PIN för admin)
+else updateTournURL();                        // spegla aktiv turnering i adressen (?t=) om man öppnat en direkt
 render();
 cloudInit();   // anslut till molnet och synka (om aktiverat)
 </script>
