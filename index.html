@@ -186,6 +186,7 @@
     <p class="sub" id="appSub">Dalarö Tennisklubb</p>
   </div>
   <div class="spacer"></div>
+  <button id="homeBtn" class="btn ghost mini no-print" style="white-space:nowrap;display:none">🏠 Startsida</button>
   <button id="linkBtn" class="btn ghost mini no-print publiconly" style="white-space:nowrap"></button>
   <button id="adminBtn" class="btn ghost mini no-print" style="white-space:nowrap"></button>
   <div class="sync-badge no-print js-sync" id="syncBadge" style="font-size:12px;opacity:.95;white-space:nowrap"></div>
@@ -367,7 +368,9 @@ function playersOf(m){
 
 /* ---------------- State ---------------- */
 let state = normalize(load() || newState());
-let ui = { tab:"classes", classId: state.classes[0].id, day: null };
+// view: "start" = generell startsida (välj/skapa/radera turnering), "tournament" = en öppen turnering.
+// Har länken ?t=nyckel öppnas turneringen direkt, annars möts man av startsidan.
+let ui = { view: (tournKeyFromURL() ? "tournament" : "start"), tab:"info", classId: (state.classes[0] && state.classes[0].id) || null, day: null };
 ensureDay();
 
 function newState(){
@@ -398,6 +401,16 @@ function newState(){
       participants:[], matches:[], champion:null
     }))
   };
+}
+// Tomt tillstånd för en HELT NY turnering: inga klasser, inga deltagare, tom logga,
+// vit bakgrund och svarta rubriker.
+function newBlankState(){
+  const s=newState();
+  s.classes=[];            // inga klasser definierade
+  s.logo="";               // tom logga
+  s.bgColor="#ffffff";     // vit bakgrund
+  s.headColor="#000000";   // svarta rubriker
+  return s;
 }
 // Säkerställ att äldre/importerade tillstånd har förväntade fält.
 function normalize(s){
@@ -573,9 +586,14 @@ function updateAdminBtn(){
   const b=document.getElementById("adminBtn"); if(!b) return;
   if(isAdmin()){ b.textContent="🔓 "+L("Publik vy","Public view"); b.title=L("Lås till publik läsvy (dölj redigering)","Lock to public read-only view"); b.onclick=lockAdmin; }
   else { b.textContent="🔒 Admin"; b.title=L("Lås upp redigering (kräver PIN)","Unlock editing (requires PIN)"); b.onclick=promptAdmin; }
-  // Publik länk-knapp (visas endast i publik vy via .publiconly).
+  const onStart = ui.view==="start";
+  // Hem-knapp: visas bara när en turnering är öppen (inte på startsidan).
+  const hb=document.getElementById("homeBtn");
+  if(hb){ hb.style.display = onStart ? "none" : ""; hb.textContent="🏠 "+L("Startsida","Home"); hb.onclick=goHome; }
+  // Publik länk-knapp (visas endast i publik vy via .publiconly, och inte på startsidan).
   const lb=document.getElementById("linkBtn");
   if(lb){
+    lb.style.display = onStart ? "none" : "";
     lb.textContent="🔗 "+L("Kopiera länk","Copy link");
     lb.title=L("Kopiera länk till denna turnerings publika sida","Copy link to this tournament's public page");
     lb.onclick=async ()=>{ const ok=await copyTournLinkTo(); if(ok){ const o=lb.textContent; lb.textContent="✓ "+L("Kopierad","Copied"); setTimeout(()=>{ lb.textContent=o; }, 1500); } };
@@ -608,6 +626,13 @@ async function cloudGet(){
   try{ r = await fetch(`${SUPA_URL}/tournaments?key=eq.${encodeURIComponent(TOURN_KEY)}&select=data`, { headers: cloudHeaders() }); }
   catch(e){ cloudLastError="Nätverksfel (GET): "+e.message; throw e; }
   if(!r.ok){ const body=await r.text().catch(()=>"" ); cloudLastError=`GET HTTP ${r.status} – ${body.slice(0,180)}`; throw new Error(cloudLastError); }
+  const rows = await r.json();
+  return (Array.isArray(rows) && rows.length) ? rows[0].data : null;
+}
+// Hämta en SPECIFIK turnerings data ur molnet (för kopiera-från på startsidan).
+async function cloudGetKey(key){
+  const r = await fetch(`${SUPA_URL}/tournaments?key=eq.${encodeURIComponent(key)}&select=data`, { headers: cloudHeaders() });
+  if(!r.ok){ const body=await r.text().catch(()=>""); throw new Error(`HTTP ${r.status} – ${body.slice(0,140)}`); }
   const rows = await r.json();
   return (Array.isArray(rows) && rows.length) ? rows[0].data : null;
 }
@@ -711,11 +736,13 @@ async function cloudForcePull(){
 // Hämta alla turneringar ur molnet: [{key, name}] (diag-/systemrader döljs).
 async function cloudListTournaments(){
   if(!cloudEnabled) return [];
-  const url=`${SUPA_URL}/tournaments?select=key,name:data->tournament->>name`;
+  const url=`${SUPA_URL}/tournaments?select=key,name:data->tournament->>name,archived:data->>archived`;
   const r=await fetch(url, { headers: cloudHeaders() });
   if(!r.ok){ const b=await r.text().catch(()=>""); cloudLastError=`LISTA HTTP ${r.status} – ${b.slice(0,180)}`; throw new Error(cloudLastError); }
   const rows=await r.json();
-  return (Array.isArray(rows)?rows:[]).filter(x=>x.key && !x.key.startsWith("__"));
+  return (Array.isArray(rows)?rows:[])
+    .filter(x=>x.key && !x.key.startsWith("__"))
+    .map(x=>({ key:x.key, name:x.name, archived: x.archived===true || x.archived==="true" }));
 }
 // Skapa en ny, tom turnering och gör den aktiv.
 async function createTournament(name){
@@ -725,69 +752,124 @@ async function createTournament(name){
   if(isAdmin()) await cloudForcePush();                       // spara pågående turnering först
   const key=(fileSafe(name).toLowerCase()||"turnering")+"-"+Date.now().toString(36);   // unik nyckel
   localStorage.setItem("km_current_tourn", key); TOURN_KEY=key; updateTournURL();   // byt aktiv turnering
-  state=newState(); state.tournament.name=name; state.updatedAt=Date.now();
+  state=newBlankState(); state.tournament.name=name; state.updatedAt=Date.now();   // helt tom turnering
   saveLocal();
-  ui={ tab:"info", classId:state.classes[0].id, day:null }; ensureDay();
+  ui={ view:"tournament", tab:"info", classId:(state.classes[0]&&state.classes[0].id)||null, day:null }; ensureDay();
   if(cloudEnabled){ try{ cloudSetStatus("saving"); await cloudPut(state); cloudLastSync=Date.now(); cloudSetStatus("ok"); }catch(e){ cloudSetStatus("offline"); } }
   render();
 }
-// Bygg ett kopie-tillstånd: behåll klasser, deltagare och inställningar men NOLLSTÄLL resultat
-// (stegar, vinnare, schemaplaceringar, mästare, låsta dagar och arkivstatus).
-function makeCopyState(src, newName){
-  const s=JSON.parse(JSON.stringify(src));                    // djupkopia
-  s.tournament=s.tournament||defaultTournament();
-  s.tournament.name=newName;
-  s.archived=false; s.archivedAt=0;
-  s.lockedDays={}; s.planFinalDays={}; s.planCourts={};
-  (s.classes||[]).forEach(c=>{ c.matches=[]; c.champion=null; });   // töm stegar + mästare (behåll deltagare)
-  return normalize(s);
+// Bygg ett kopie-tillstånd. opts väljer VAD som kopieras från källan:
+//   opts.info    = Turneringsinformation (datum, arrangör, tävlingsledare, schema, banor, logga, färger …)
+//   opts.classes = Klasser & deltagare (behåller deltagare, men NOLLSTÄLLER resultat/stegar/mästare)
+// Det som inte kopieras blir tomt som i en ny turnering.
+function makeCopyState(src, newName, opts){
+  opts = opts || { info:true, classes:true };
+  const base = newBlankState();
+  base.tournament = { ...defaultTournament(), name:newName };
+  if(opts.info){
+    const s=JSON.parse(JSON.stringify(src));
+    base.tournament = { ...(s.tournament||defaultTournament()), name:newName };
+    base.arranger=s.arranger; base.organizer=s.organizer; base.chairman=s.chairman;
+    base.trainers=s.trainers; base.diplomaSigns=s.diplomaSigns; base.sched=s.sched;
+    base.venue=s.venue; base.courts=s.courts; base.logo=s.logo;
+    base.bgColor=s.bgColor; base.headColor=s.headColor; base.extraCourts=s.extraCourts;
+    base.adminPin=s.adminPin;
+  }
+  if(opts.classes){
+    const s=JSON.parse(JSON.stringify(src));
+    base.classes=(s.classes||[]).map(c=>({ ...c, matches:[], champion:null }));   // behåll deltagare, nollställ resultat
+  }
+  base.archived=false; base.archivedAt=0;
+  base.lockedDays={}; base.planFinalDays={}; base.planCourts={};
+  return normalize(base);
 }
-// Skapa en ny turnering som kopia av den AKTIVA turneringen (byt först till den du vill kopiera).
-async function createTournamentCopy(newName){
+// Skapa en ny turnering som kopia av en KÄLLTURNERING (state-objekt) med valda delar.
+async function createTournamentCopy(newName, opts, sourceState){
   if(!isAdmin()) return;
   newName=(newName||"").trim();
   if(!newName){ alert("Ange ett namn på den nya turneringen."); return; }
-  await cloudForcePush();                                     // spara källturneringen först
-  const copy=makeCopyState(state, newName);
+  await cloudForcePush();                                     // spara pågående turnering först
+  const copy=makeCopyState(sourceState||state, newName, opts);
   const key=(fileSafe(newName).toLowerCase()||"turnering")+"-"+Date.now().toString(36);
   localStorage.setItem("km_current_tourn", key); TOURN_KEY=key; updateTournURL();
   state=copy; state.updatedAt=Date.now();
   saveLocal();
-  ui={ tab:"info", classId:state.classes[0].id, day:null }; ensureDay();
+  ui={ view:"tournament", tab:"info", classId:(state.classes[0]&&state.classes[0].id)||null, day:null }; ensureDay();
   if(cloudEnabled){ try{ cloudSetStatus("saving"); await cloudPut(state); cloudLastSync=Date.now(); cloudSetStatus("ok"); }catch(e){ cloudSetStatus("offline"); } }
   render();
 }
-// Byt till en befintlig turnering (hämtar dess data ur molnet).
+// Byt till en befintlig turnering (hämtar dess data ur molnet) och öppna den.
 async function switchTournament(key){
-  if(!key || key===TOURN_KEY) return;
+  if(!key) return;
   if(isAdmin()) await cloudForcePush();                       // spara pågående turnering först
   localStorage.setItem("km_current_tourn", key); TOURN_KEY=key; updateTournURL();
   cloudSetStatus("connecting");
   try{
     const data=await cloudGet();
-    state = data ? normalize(data) : newState();
+    state = data ? normalize(data) : newBlankState();
     if(!data && isAdmin()){ state.updatedAt=Date.now(); await cloudPut(state); }   // fanns ej i molnet – skapa raden
     cloudLastSync=Date.now(); cloudSetStatus("ok");
-  }catch(e){ state=load()||newState(); cloudSetStatus("offline"); }
+  }catch(e){ state=load()||newBlankState(); cloudSetStatus("offline"); }
   saveLocal();
-  ui={ tab:"info", classId:state.classes[0].id, day:null }; ensureDay(); render();
+  ui={ view:"tournament", tab:"info", classId:(state.classes[0]&&state.classes[0].id)||null, day:null }; ensureDay(); render();
 }
-// Ta bort en turnering permanent ur molnet (kräver att man skriver namnet).
+// Öppna en turnering från startsidan (fungerar även om det är den redan aktiva nyckeln).
+async function openTournament(key){
+  if(key && key!==TOURN_KEY){ await switchTournament(key); return; }
+  updateTournURL();
+  ui={ view:"tournament", tab:"info", classId:(state.classes[0]&&state.classes[0].id)||null, day:null };
+  ensureDay(); render();
+}
+// Tillbaka till startsidan (rensar ?t= ur adressen).
+function goHome(){
+  ui.view="start";
+  try{ const u=new URL(location.href); u.searchParams.delete("t"); history.replaceState(null,"",u.pathname+u.search+u.hash); }catch(e){}
+  render();
+}
+// Radera en molnrad och VERIFIERA att den verkligen togs bort. Returnerar true/false.
+// (PostgREST svarar 204 även när RLS blockerar och 0 rader tas bort – därav return=representation.)
+async function cloudDeleteRow(key){
+  try{
+    const r=await fetch(`${SUPA_URL}/tournaments?key=eq.${encodeURIComponent(key)}`, {
+      method:"DELETE", headers: cloudHeaders({ Prefer:"return=representation" }) });
+    if(!r.ok){ const b=await r.text().catch(()=>""); throw new Error(`HTTP ${r.status} ${b.slice(0,140)}`); }
+    const del=await r.json().catch(()=>null);
+    if(!Array.isArray(del) || del.length===0){
+      alert("Turneringen kunde INTE raderas (0 rader togs bort).\n\nTrolig orsak: Supabase saknar en RLS-policy som ger 'anon' rätt att radera (DELETE).\n\nKör denna SQL i Supabase → SQL Editor:\n\ncreate policy \"anon delete\" on public.tournaments for delete using (true);");
+      return false;
+    }
+    return true;
+  }catch(e){ alert("Kunde inte ta bort i molnet: "+(e.message||e)); return false; }
+}
+// Radera AKTIV turnering inifrån (kortet i Turneringsinformation). Arkiverade måste låsas upp först.
 async function deleteTournament(key){
   if(!isAdmin() || !cloudEnabled) return;
+  if(isArchived()){ alert("Den här turneringen är arkiverad (skrivskyddad). Lås upp den först för att kunna radera."); return; }
   let list=[]; try{ list=await cloudListTournaments(); }catch(e){ alert("Kunde inte läsa turneringslistan: "+(e.message||e)); return; }
   if(list.length<=1){ alert("Det går inte att ta bort den enda turneringen. Skapa en ny först."); return; }
   const cur=list.find(x=>x.key===key); const nm=(cur&&cur.name)||key;
   const typed=prompt(`Ta bort turneringen "${nm}" permanent ur molnet? Skriv turneringens namn för att bekräfta:`);
   if(typed==null) return;
   if(typed.trim()!==String(nm).trim()){ alert("Namnet stämmer inte – avbryter."); return; }
-  try{
-    const r=await fetch(`${SUPA_URL}/tournaments?key=eq.${encodeURIComponent(key)}`, { method:"DELETE", headers: cloudHeaders() });
-    if(!r.ok) throw new Error("HTTP "+r.status);
-  }catch(e){ alert("Kunde inte ta bort i molnet: "+(e.message||e)); return; }
+  if(!await cloudDeleteRow(key)) return;
   try{ localStorage.removeItem("km_"+key); }catch(e){}        // städa lokal cache för den borttagna
   const other=list.find(x=>x.key!==key);                      // byt till en kvarvarande turnering
-  await switchTournament(other.key);
+  if(other) await switchTournament(other.key); else goHome();
+}
+// Radera en turnering FRÅN STARTSIDAN (byter inte in i någon turnering). Arkiverade kan inte raderas.
+async function deleteTournamentFromStart(key){
+  if(!isAdmin() || !cloudEnabled) return;
+  let list=[]; try{ list=await cloudListTournaments(); }catch(e){ alert("Kunde inte läsa turneringslistan: "+(e.message||e)); return; }
+  const cur=list.find(x=>x.key===key); if(!cur){ render(); return; }
+  if(cur.archived){ alert("Arkiverade turneringar kan inte raderas här. Öppna turneringen, lås upp den och radera den därifrån."); return; }
+  const nm=cur.name||key;
+  const typed=prompt(`Ta bort turneringen "${nm}" permanent ur molnet? Skriv turneringens namn för att bekräfta:`);
+  if(typed==null) return;
+  if(typed.trim()!==String(nm).trim()){ alert("Namnet stämmer inte – avbryter."); return; }
+  if(!await cloudDeleteRow(key)) return;
+  try{ localStorage.removeItem("km_"+key); }catch(e){}
+  if(key===TOURN_KEY){ try{ localStorage.removeItem("km_current_tourn"); }catch(e){} }
+  render();   // uppdatera startsidans lista (stannar kvar på startsidan)
 }
 // Felsökning: testar läsning + skrivning mot Supabase och förklarar vad som är fel.
 async function cloudDiagnose(){
@@ -1203,9 +1285,9 @@ function applyLang(){
 /* ---------------- Logga & bakgrund (anpassningsbart) ---------------- */
 // Loggan: egen uppladdad bild om sådan finns, annars klubbmärket (LOGO_SVG).
 function logoMarkup(){
-  return state.logo
-    ? `<img src="${state.logo}" alt="Logga" style="width:100%;height:100%;object-fit:contain">`
-    : LOGO_SVG;
+  if(state.logo) return `<img src="${state.logo}" alt="Logga" style="width:100%;height:100%;object-fit:contain">`;
+  if(state.logo==="") return "";      // uttryckligen tom logga (t.ex. ny turnering)
+  return LOGO_SVG;                     // null/odefinierad = standardlogga
 }
 // Rubrikfärg (används i appen och på utskrifter). Standard = klubbröd.
 function headColor(){ return (state.headColor||"").trim() || "#b5362b"; }
@@ -1228,6 +1310,7 @@ function render(){
   applyTheme();
   updateAdminBtn();
   document.body.classList.toggle("public", !isAdmin());
+  if(ui.view==="start"){ renderStart(); return; }   // generell startsida (välj/skapa/radera turnering)
   document.body.classList.toggle("archived", isArchived());
   // Publik läsvy får bara besöka tillåtna flikar (beror på om turneringen är arkiverad).
   if(!isAdmin()){
@@ -1274,6 +1357,98 @@ function renderTabs(){
   document.getElementById("tabs").innerHTML=tabs.map(([k,l])=>
     `<button class="${ui.tab===k?'active':''}" data-tab="${k}">${l}</button>`).join("");
   document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{ui.tab=b.dataset.tab;render();});
+}
+
+/* ===================== Startsida (generell för alla turneringar) ===================== */
+function renderStart(){
+  document.body.classList.remove("archived");
+  const at=document.getElementById("appTitle"); if(at) at.textContent=L("Turneringar","Tournaments");
+  const as=document.getElementById("appSub");   if(as) as.textContent=L("Välj, skapa eller hantera turneringar","Select, create or manage tournaments");
+  document.title=L("Turneringar","Tournaments");
+  const tb=document.getElementById("tabs"); if(tb) tb.innerHTML="";
+  const admin=isAdmin();
+  app.innerHTML=`
+   <div class="card">
+     <h2>${L('Turneringar','Tournaments')}</h2>
+     <p class="small muted">${admin
+       ? L('Öppna en turnering, skapa en ny eller radera. Arkiverade turneringar visas när du bockar i rutan nedan.','Open a tournament, create a new one or delete. Archived tournaments appear when you tick the box below.')
+       : L('Välj en turnering att öppna. Lås upp admin (uppe till höger) för att skapa eller radera.','Choose a tournament to open. Unlock admin (top right) to create or delete.')}</p>
+     ${admin?`<div class="row" style="margin-bottom:6px"><button class="btn" id="startNewBtn">➕ ${L('Ny turnering','New tournament')}</button></div><div id="newFormWrap"></div>`:''}
+     <label class="small" style="display:inline-flex;align-items:center;gap:6px;margin:10px 0 4px">
+       <input type="checkbox" id="showArchivedChk" ${ui.startShowArchived?'checked':''}> ${L('Visa arkiverade turneringar','Show archived tournaments')}</label>
+     <div id="startList" style="margin-top:6px"><p class="muted">${cloudEnabled?L('Laddar…','Loading…'):L('Molnsynk är inte aktiverad – flera turneringar kräver molnet.','Cloud sync is not enabled – multiple tournaments require the cloud.')}</p></div>
+   </div>`;
+  const chk=document.getElementById("showArchivedChk"); if(chk) chk.onchange=()=>{ ui.startShowArchived=chk.checked; render(); };
+  const nb=document.getElementById("startNewBtn"); if(nb) nb.onclick=()=>{ ui.startNewOpen=!ui.startNewOpen; render(); };
+  if(!cloudEnabled) return;
+  cloudListTournaments().then(list=>{
+    startRenderList(list);
+    if(admin && ui.startNewOpen) startRenderNewForm(list);
+  }).catch(e=>{
+    const el=document.getElementById("startList"); if(el) el.innerHTML=`<p class="empty">${L('Kunde inte läsa turneringar','Could not load tournaments')}: ${e.message}</p>`;
+  });
+}
+function startRenderList(list){
+  const el=document.getElementById("startList"); if(!el) return;
+  const admin=isAdmin();
+  const shown=(list||[]).filter(t=>ui.startShowArchived || !t.archived)
+    .sort((a,b)=>String(a.name||a.key).localeCompare(String(b.name||b.key),"sv"));
+  if(!shown.length){
+    el.innerHTML=`<p class="empty">${ui.startShowArchived?L('Inga turneringar ännu.','No tournaments yet.'):L('Inga aktiva turneringar. Bocka i "Visa arkiverade" eller skapa en ny.','No active tournaments. Tick "Show archived" or create a new one.')}</p>`;
+    return;
+  }
+  el.innerHTML=`<table class="results" style="width:100%"><tbody>${shown.map(t=>{
+    const nm=t.name||t.key;
+    const badge=t.archived?` <span class="badge" style="background:#e3f1de;color:var(--green)">📦 ${L('Arkiverad','Archived')}</span>`:'';
+    const esc=String(t.key).replace(/"/g,'&quot;');
+    const del = admin ? (t.archived
+        ? `<span class="small muted">${L('öppna & lås upp för att radera','open & unlock to delete')}</span>`
+        : `<button class="btn ghost mini" data-del="${esc}">🗑 ${L('Radera','Delete')}</button>`) : '';
+    return `<tr>
+       <td><b>${nm}</b>${badge}</td>
+       <td style="text-align:right;white-space:nowrap">
+         <button class="btn mini" data-open="${esc}">${L('Öppna','Open')} →</button> ${del}
+       </td></tr>`;
+  }).join("")}</tbody></table>`;
+  el.querySelectorAll("[data-open]").forEach(b=>b.onclick=()=>openTournament(b.dataset.open));
+  el.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>deleteTournamentFromStart(b.dataset.del));
+}
+function startRenderNewForm(list){
+  const wrap=document.getElementById("newFormWrap"); if(!wrap) return;
+  const opts=(list||[]).slice().sort((a,b)=>String(a.name||a.key).localeCompare(String(b.name||b.key),"sv"))
+    .map(t=>`<option value="${String(t.key).replace(/"/g,'&quot;')}">${(t.name||t.key)}${t.archived?' ('+L('arkiverad','archived')+')':''}</option>`).join("");
+  wrap.innerHTML=`<div class="card" style="background:#faf6ec">
+     <div class="row" style="align-items:flex-end;gap:10px">
+       <label class="small" style="flex:1;min-width:200px">${L('Namn på ny turnering','New tournament name')}<br>
+         <input type="text" id="newTName" placeholder="${L('t.ex. Klubbmästerskap 2027','e.g. Club Championship 2027')}" style="width:100%;max-width:320px"></label>
+       <label class="small">${L('Skapa som kopia av','Create as a copy of')}<br>
+         <select id="newCopyFrom"><option value="">${L('— tom turnering —','— empty tournament —')}</option>${opts}</select></label>
+     </div>
+     <div id="copyChoices" class="row" style="margin-top:8px;display:none;gap:16px;align-items:center">
+       <span class="small"><b>${L('Kopiera:','Copy:')}</b></span>
+       <label class="small"><input type="checkbox" id="copyInfo" checked> ${L('Turneringsinformation','Tournament info')}</label>
+       <label class="small"><input type="checkbox" id="copyClasses" checked> ${L('Klasser och deltagare','Classes and players')}</label>
+       <span class="small muted">${L('(resultat nollställs alltid)','(results are always reset)')}</span>
+     </div>
+     <div class="row" style="margin-top:10px">
+       <button class="btn" id="newCreateBtn">✓ ${L('Skapa turnering','Create tournament')}</button>
+       <button class="btn ghost mini" id="newCancelBtn">${L('Avbryt','Cancel')}</button>
+     </div>
+   </div>`;
+  const sel=document.getElementById("newCopyFrom"), cc=document.getElementById("copyChoices");
+  sel.onchange=()=>{ cc.style.display = sel.value ? "flex" : "none"; };
+  document.getElementById("newCancelBtn").onclick=()=>{ ui.startNewOpen=false; render(); };
+  document.getElementById("newCreateBtn").onclick=async ()=>{
+    const name=(document.getElementById("newTName").value||"").trim();
+    if(!name){ alert(L("Ange ett namn på turneringen.","Enter a tournament name.")); return; }
+    const from=sel.value; ui.startNewOpen=false;
+    if(!from){ await createTournament(name); return; }
+    const info=document.getElementById("copyInfo").checked, classes=document.getElementById("copyClasses").checked;
+    let src=null;
+    try{ src=await cloudGetKey(from); }catch(e){ alert(L("Kunde inte läsa källturneringen: ","Could not read the source tournament: ")+(e.message||e)); return; }
+    if(!src){ alert(L("Källturneringen hittades inte.","Source tournament not found.")); return; }
+    await createTournamentCopy(name, {info, classes}, normalize(src));
+  };
 }
 
 /* ----- Flik: Klubbmästare ----- */
@@ -1902,6 +2077,25 @@ function renderPlayerSearch(){
 
 /* ----- Tab 1: Klasser & deltagare ----- */
 function renderClasses(){
+  if(!state.classes.length){
+    app.innerHTML=`
+     <div class="card">
+       <h2>${L('Klasser & deltagare','Classes & players')}</h2>
+       <p class="small muted">${L('Den här turneringen har inga klasser ännu. Skapa din första klass för att börja lägga in deltagare.','This tournament has no classes yet. Create your first class to start adding players.')}</p>
+       <div class="row" style="align-items:flex-end;gap:8px;flex-wrap:wrap">
+         <label class="small">${L('Ny klass – namn','New class – name')}<br>
+           <input type="text" id="newClsName" placeholder="${L('Klassens namn','Class name')}" style="min-width:180px"></label>
+         <label class="small">${L('Typ','Type')}<br>
+           <select id="newClsType">
+             <option value="adult">${L('Senior (13–21)','Senior (13–21)')}</option>
+             <option value="youth">${L('Junior (9–13)','Junior (9–13)')}</option>
+           </select></label>
+         <button class="btn mini" id="addClassBtn">➕ ${L('Skapa klass','Create class')}</button>
+       </div>
+     </div>`;
+    const ab=document.getElementById("addClassBtn"); if(ab) ab.onclick=addClass_;
+    return;
+  }
   const cls=getClass(ui.classId)||state.classes[0]; ui.classId=cls.id;
   // Namn som redan finns registrerade i andra klasser (och inte redan i denna klass).
   const inThisClass=new Set();
@@ -2117,6 +2311,7 @@ function rebuildBracketOf(cls){
 
 /* ----- Tab 2: Stege ----- */
 function renderBracketTab(){
+  if(!state.classes.length){ app.innerHTML=`<div class="card"><h2>${L('Stege','Bracket')}</h2><p class="muted">${L('Inga klasser ännu. Skapa klasser under Klasser & deltagare.','No classes yet. Create classes under Classes & players.')}</p></div>`; return; }
   const cls=getClass(ui.classId)||state.classes[0];
   app.innerHTML=`
    <div class="card no-print">
@@ -3176,21 +3371,33 @@ function renderPlanner(){
 
 /* ----- Tab: Deltagarlista (per person, utifrån namn) ----- */
 function participantIndex(filterId){
-  const map=new Map(); // namn -> Set(klassnamn)
+  const map=new Map(); // namn -> {classes:Set, played:antal spelade matcher}
   const classes = filterId ? state.classes.filter(c=>c.id===filterId) : visibleClasses();
   for(const c of classes){
     for(const line of c.participants){
       for(const part of String(line).split("/")){
         const nm=stripRank(part);
         if(!nm) continue;
-        if(!map.has(nm)) map.set(nm,new Set());
-        map.get(nm).add(c.name);
+        if(!map.has(nm)) map.set(nm,{classes:new Set(), played:0});
+        map.get(nm).classes.add(c.name);
       }
     }
   }
-  return [...map.entries()]
-    .map(([name,set])=>({name, classes:[...set]}))
-    .sort((a,b)=> a.name.localeCompare(b.name,"sv"));
+  // Räkna spelade matcher (matcher med registrerad vinnare, ej bye) per person.
+  for(const c of classes){
+    for(const m of c.matches){
+      if(!m.winner || isByeMatch(m)) continue;
+      for(const nm of playersOf(m)){ if(map.has(nm)) map.get(nm).played++; }
+    }
+  }
+  const arr=[...map.entries()].map(([name,v])=>({name, classes:[...v.classes], played:v.played}));
+  const sort=ui.partSort||"name";
+  arr.sort((a,b)=>{
+    if(sort==="classes") return (b.classes.length-a.classes.length) || a.name.localeCompare(b.name,"sv");
+    if(sort==="matches") return (b.played-a.played) || a.name.localeCompare(b.name,"sv");
+    return a.name.localeCompare(b.name,"sv");
+  });
+  return arr;
 }
 // Byt ut ett individnamn i en sträng (dubbelpar delas på "/"), behåll ev. rank "(n)".
 function replaceIndivName(str, oldName, newName){
@@ -3249,6 +3456,11 @@ function renderParticipants(){
      <p class="small muted">Välj klass för att söka/lista deltagare i en specifik klass (eller "Alla klasser"). Dubbelpar delas på "/".</p>
      <div class="row">
        <label class="small">Klass: <select id="partClass">${classOpts}</select></label>
+       <label class="small">Sortera: <select id="partSort">
+         <option value="name" ${(ui.partSort||'name')==='name'?'selected':''}>Namn</option>
+         <option value="classes" ${ui.partSort==='classes'?'selected':''}>Antal klasser</option>
+         <option value="matches" ${ui.partSort==='matches'?'selected':''}>Antal matcher</option>
+       </select></label>
        <input type="text" id="playerSearch" placeholder="🔎 Sök deltagare…" value="${(ui.playerSearch||'').replace(/"/g,'&quot;')}" style="min-width:200px">
        ${q?`<button class="btn ghost mini" id="clrSearch">✕ Rensa</button>`:''}
        <span class="pill">${idx.length} personer${fcls?` i ${fcls.name}`:''}</span>
@@ -3258,6 +3470,7 @@ function renderParticipants(){
    </div>`;
   const bindTop=()=>{
     document.getElementById("partClass").onchange=e=>{ ui.partClass=e.target.value; render(); };
+    { const ss=document.getElementById("partSort"); if(ss) ss.onchange=e=>{ ui.partSort=e.target.value; render(); }; }
     const si=document.getElementById("playerSearch");
     si.oninput=e=>{ ui.playerSearch=e.target.value; ui._sf=true; render(); };
     if(ui._sf){ const el=document.getElementById("playerSearch"); if(el){ el.focus(); el.setSelectionRange(el.value.length,el.value.length); } ui._sf=false; }
@@ -3291,9 +3504,9 @@ function renderParticipants(){
   }
   // Full lista med byt-namn
   html+=`<div class="card"><table class="results"><thead>
-     <tr><th>Namn</th><th>${fcls?'Klass':'Antal klasser'}</th><th>${fcls?'':'Klasser'}</th><th class="no-print"></th></tr></thead><tbody>`;
+     <tr><th>Namn</th><th>${fcls?'Klass':'Antal klasser'}</th><th>Antal matcher</th>${fcls?'':'<th>Klasser</th>'}<th class="no-print"></th></tr></thead><tbody>`;
   for(const r of idx)
-    html+=`<tr><td>${r.name}</td><td>${fcls?r.classes.join(", "):r.classes.length}</td><td>${fcls?'':r.classes.join(", ")}</td>
+    html+=`<tr><td>${r.name}</td><td>${fcls?r.classes.join(", "):r.classes.length}</td><td>${r.played}</td>${fcls?'':`<td>${r.classes.join(", ")}</td>`}
       <td class="no-print"><button class="btn ghost mini" data-rename="${r.name.replace(/"/g,'&quot;')}">✏️ Byt namn</button>
       <button class="btn ghost mini" data-find="${r.name.replace(/"/g,'&quot;')}">🔎 Matcher</button></td></tr>`;
   html+=`</tbody></table></div>`;
@@ -3979,7 +4192,7 @@ function exportBackup(){
 document.getElementById("importFile").onchange=e=>{
   const f=e.target.files[0]; if(!f) return;
   const r=new FileReader();
-  r.onload=()=>{ try{ state=normalize(JSON.parse(r.result)); save(); ui.classId=state.classes[0].id; ensureDay(); render(); alert("Importerat!"); }
+  r.onload=()=>{ try{ state=normalize(JSON.parse(r.result)); save(); ui.classId=(state.classes[0]&&state.classes[0].id)||null; ensureDay(); render(); alert("Importerat!"); }
     catch(err){ alert("Kunde inte läsa filen."); } };
   r.readAsText(f);
   e.target.value="";   // tillåt att importera samma fil igen
@@ -4022,7 +4235,7 @@ const LOGO_SVG = `
 </svg>`;
 document.getElementById("logoHolder").innerHTML=LOGO_SVG;
 
-updateTournURL();   // se till att adressen speglar aktiv turnering (?t=nyckel) redan vid start
+if(ui.view!=="start") updateTournURL();   // spegla aktiv turnering i adressen (?t=) om man öppnat en direkt
 render();
 cloudInit();   // anslut till molnet och synka (om aktiverat)
 </script>
