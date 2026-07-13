@@ -410,6 +410,7 @@ function newBlankState(){
   s.logo="";               // tom logga
   s.bgColor="#ffffff";     // vit bakgrund
   s.headColor="#000000";   // svarta rubriker
+  s.adminPin="0000";       // standard-PIN för en ny turnering
   return s;
 }
 // Säkerställ att äldre/importerade tillstånd har förväntade fält.
@@ -1364,6 +1365,12 @@ function renderTabs(){
 /* ===================== Startsida (generell för alla turneringar) ===================== */
 function renderStart(){
   document.body.classList.remove("archived");
+  // Startsidan har ALLTID vit bakgrund, ingen logga och svarta rubriker (oberoende av turnering).
+  document.body.style.background="#ffffff";
+  const hdr=document.querySelector("header.app"); if(hdr) hdr.style.background="#ffffff";
+  document.documentElement.style.setProperty("--head","#000000");
+  const lh=document.getElementById("logoHolder"); if(lh) lh.innerHTML="";
+  const sb=document.getElementById("syncBadge"); if(sb) sb.style.color="#1a1a1a";
   const at=document.getElementById("appTitle"); if(at) at.textContent=L("Turneringar","Tournaments");
   const as=document.getElementById("appSub");   if(as) as.textContent=L("Välj, skapa eller hantera turneringar","Select, create or manage tournaments");
   document.title=L("Turneringar","Tournaments");
